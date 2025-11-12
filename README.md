@@ -19,5 +19,6 @@ test it on port 3030
 curl -v http://localhost:3030/
 ```
 ## TODO
-[] cleanup the code
-[] http/1.1
+- [x] http/1.0
+- [ ] cleanup the code
+- [ ] http/1.1
