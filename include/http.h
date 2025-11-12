@@ -25,7 +25,13 @@ static const struct content_type_map {
 } CONTENT_TYPES[] = {
     {".html", "text/html"},
     {".css",  "text/css"},
-
+    {".js",   "application/javascript"},
+    {".json", "application/json"},
+    {".txt",  "text/plain"},
+    {".jpg",  "image/jpeg"},
+    {".jpeg", "image/jpeg"},
+    {".png",  "image/png"},
+    {".gif",  "image/gif"},
     {NULL, NULL}
 };
 
