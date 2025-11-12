@@ -1,0 +1,6 @@
+CompileFlags:
+  Add: [-Wall, -Wextra, -Wunused, -xc, -I../include]
+Diagnostics:
+  UnusedIncludes: Strict
+  ClangTidy:
+    Add: [readability-*, modernize-*, bugprone-*]
