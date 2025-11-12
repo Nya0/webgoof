@@ -18,3 +18,6 @@ test it on port 3030
 ```bash
 curl -v http://localhost:3030/
 ```
+## TODO
+[] cleanup the code
+[] http/1.1
