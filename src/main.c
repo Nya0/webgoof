@@ -2,9 +2,7 @@
 #include "log.h"
 
 #include <arpa/inet.h>
-#include <asm-generic/socket.h>
 #include <errno.h>
-#include <fcntl.h>
 #include <netinet/in.h>
 #include <pthread.h>
 #include <signal.h>
@@ -12,6 +10,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/sendfile.h>
+#include <sys/socket.h>
+#include <fcntl.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <time.h>
@@ -28,7 +28,7 @@ struct http_client {
 	struct sockaddr_in addr;
 	socklen_t addr_len;
 
-	char* web_root;
+	char *web_root;
 };
 
 void *handle_client(void *args) {
@@ -144,7 +144,7 @@ cleanup:
 	return 0;
 }
 
-int listen_and_serve(int port, char* web_root) {
+int listen_and_serve(int port, char *web_root) {
 	signal(SIGPIPE, SIG_IGN);
 
 	log_init(stderr);
