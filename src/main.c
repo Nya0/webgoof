@@ -17,7 +17,7 @@
 #include <time.h>
 #include <unistd.h>
 
-#define QUEUE_SIZE 10
+#define QUEUE_SIZE 128
 #define DEFAULT_PORT "3030"
 #define DEFAULT_WEB_ROOT "./public"
 
