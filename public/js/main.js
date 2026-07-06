@@ -1,46 +1,46 @@
-document.addEventListener('DOMContentLoaded', function() {
-    const button = document.getElementById('testBtn');
+document.addEventListener('DOMContentLoaded', () => {
+    const button = document.getElementById('button');
     const message = document.getElementById('message');
-    
-    const responses = [
-        'connection successful',
-        'server responding',
-        'latency: 12ms',
-        'all systems operational',
-        'ping: 200 OK',
-        'status: running',
-        'uptime: 99.9%',
-        'response code: 200',
-        'health check passed',
-        'connection stable'
-    ];
-    
+    const navigateButton = document.getElementById('hidden-button');
+
+    navigateButton.hidden = true;
+
+    const responses = {
+        1: "ok lets go click somewhere",
+        4: "ok i mean click here",
+        5: "do u not see it???",
+        9: "ok fine click here"
+    };
+
     let clickCount = 0;
-    
-    button.addEventListener('click', function() {
-        // Add a glitch effect to button
-        button.style.transform = 'translateX(2px)';
-        setTimeout(() => {
-            button.style.transform = 'translateX(-2px)';
-        }, 50);
-        setTimeout(() => {
-            button.style.transform = 'translateX(0)';
-        }, 100);
-        
-        // Typing effect for message
-        const response = responses[clickCount % responses.length];
-        message.textContent = '';
+    let typeWriter = null;
+
+    button.addEventListener('click', () => {
+        clickCount++;
+
+        const response = responses[clickCount];
+        if (!response) return;
+
+        if (typeWriter) clearInterval(typeWriter);
+
+        if (message.textContent.length > 0) message.textContent += "\n";
+
         let i = 0;
-        
-        const typeWriter = setInterval(() => {
+        typeWriter = setInterval(() => {
             if (i < response.length) {
                 message.textContent += response.charAt(i);
                 i++;
             } else {
                 clearInterval(typeWriter);
             }
-        }, 30);
-        
-        clickCount++;
+        }, 10);
+
+        if (clickCount >= 9) {
+            navigateButton.hidden = false;
+        }
     });
+
+    navigateButton.addEventListener('click', () => {
+        location.href = "yum.html"
+    })
 });
