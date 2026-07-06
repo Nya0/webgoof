@@ -1,10 +1,12 @@
 # Compiler
-CC := gcc
+CC := musl-gcc
 
 # flags
 CFLAGS := -Wall -Wextra -Iinclude
 DEBUG_FLAGS := -g -O0 -fsanitize=address -fsanitize=undefined
-PROD_FLAGS := -O2 -DNDEBUG -s
+PROD_FLAGS := -Os -DNDEBUG -march=native -flto \
+  -ffunction-sections -fdata-sections -Wl,--gc-sections -s -static
+  
 LDFLAGS := -pthread
 
 # Default to debug
