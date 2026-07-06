@@ -1,26 +1,35 @@
 #include "http.h"
+#include "log.h"
 
-#include <asm-generic/socket.h>
-#include <string.h>
-#include <sys/socket.h>
-#include <netinet/in.h>
 #include <arpa/inet.h>
-#include <unistd.h>
+#include <asm-generic/socket.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <netinet/in.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <fcntl.h>
+#include <string.h>
+#include <sys/sendfile.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
+#include <time.h>
+#include <unistd.h>
 
 #define PORT 3030
 #define QUEUE_SIZE 10
 #define WEB_ROOT "./public"
 
-#define CLIENT_REQ_SIZE 1024*4
+#define CLIENT_REQ_SIZE 1024 * 4
 
 int listen_and_serve(int port) {
+	signal(SIGPIPE, SIG_IGN);
+
+	log_init(stderr);
+
 	int sockfd = socket(AF_INET, SOCK_STREAM, 0);
 	if (sockfd < 0) {
-		perror("socket");
+		LOG(LOG_ERROR, "socket: %s", strerror(errno));
 		return -1;
 	}
 
@@ -33,21 +42,28 @@ int listen_and_serve(int port) {
 	server_addr.sin_addr.s_addr = INADDR_ANY;
 	server_addr.sin_port = htons(port);
 
-	if (bind(sockfd, (struct sockaddr*) &server_addr, sizeof(server_addr)) < 0) {
-		perror("bind failed");
+	if (bind(sockfd, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
+		LOG(LOG_ERROR, "bind to port %d: %s", port, strerror(errno));
 		return -1;
 	}
 
 	if (listen(sockfd, QUEUE_SIZE) < 0) {
-		perror("listen failed");
+		LOG(LOG_ERROR, "listen: %s", strerror(errno));
 		close(sockfd);
 		return -1;
 	}
 
+	LOG(LOG_INFO, "listening on http://localhost:%d (serving %s)", port, WEB_ROOT);
+
 	while (1) {
 		struct sockaddr_in client_addr;
 		socklen_t client_len = sizeof(client_addr);
-		int clientfd = accept(sockfd, (struct sockaddr*)&client_addr, &client_len);
+
+		int client_fd = accept(sockfd, (struct sockaddr *)&client_addr, &client_len);
+		if (client_fd < 0) {
+			LOG(LOG_ERROR, "accept: %s", strerror(errno));
+			goto cleanup;
+		}
 
 		char client_ip[INET_ADDRSTRLEN] = {0};
 		inet_ntop(AF_INET, &client_addr.sin_addr, client_ip, sizeof(client_ip));
@@ -55,72 +71,100 @@ int listen_and_serve(int port) {
 		int client_port = ntohs(client_addr.sin_port);
 
 		char raw_request[CLIENT_REQ_SIZE] = {0};
-		read(clientfd, raw_request, (size_t)CLIENT_REQ_SIZE - 1);
 
-		struct http_request request;
-		parse_request(raw_request, &request);
-		printf("\nnew request!! %s:%d (%s)\n", client_ip, client_port, request.path);
-		for (int i = 0; i < request.header_count; i++) {
-			printf("%s = %s\n", request.headers[i].key, request.headers[i].value);
+		ssize_t n = read(client_fd, raw_request, (size_t)CLIENT_REQ_SIZE - 1);
+		if (n <= 0) { // connection closed or error
+			goto cleanup;
 		}
 
-
-		// parse file path
+		struct http_request request = {0}; // zero init so logging is safe even if parse fails
 		struct http_response response = {0};
-		char* file_content = NULL;
+		
+		int file_fd = -1;
+		off_t file_size = 0;
 
-		if (strstr(request.path, "..") != NULL) { // path traversal temp fix i think
-			printf("woah dude bad bad path traversal\n");
+		if (parse_request(raw_request, &request) < 0) {
+			response.status_code = HTTP_STATUS_BAD_REQUEST;
+			goto finish;
+		}
+
+		LOG(LOG_INFO, "%s %s (%s:%d)", http_method_str(request.method), request.path, client_ip, client_port);
+		for (int i = 0; i < request.header_count; i++) {
+			LOG(LOG_DEBUG, "  %s: %s", request.headers[i].key, request.headers[i].value);
+		}
+
+		// char* file_content = NULL;
+
+		if (strstr(request.path, "..") != NULL) { // path traversal temp fix
+			LOG(LOG_WARN, "blocked path traversal attempt: %s (%s:%d)", request.path, client_ip, client_port);
 
 			response.status_code = HTTP_STATUS_FORBIDDEN;
-			strcpy(response.status_text, "FORBIDDEN");
 			goto finish;
 		}
 
 		char file_path[256]; // NOLINT
 		if (strcmp(request.path, "/") == 0) {
-        	snprintf(file_path, sizeof(file_path), "%s/index.html", WEB_ROOT);
-      	} else {
-        	snprintf(file_path, sizeof(file_path), "%s%s", WEB_ROOT, request.path);
-		} 
+			snprintf(file_path, sizeof(file_path), "%s/index.html", WEB_ROOT);
+		} else {
+			snprintf(file_path, sizeof(file_path), "%s%s", WEB_ROOT, request.path);
+		}
 
-		// get file content
-		int r_fd = open(file_path, O_RDONLY);
-		if (r_fd < 0) {
-			perror("open file");
+		// open requested file
+		file_fd = open(file_path, O_RDONLY);
+		if (file_fd < 0) {
+			LOG(LOG_WARN, "open %s: %s", file_path, strerror(errno));
 
 			response.status_code = HTTP_STATUS_NOT_FOUND;
 			goto finish;
 		}
 
+		// read size
 		struct stat file_stat;
-  		fstat(r_fd, &file_stat);
-		long file_size = file_stat.st_size;
+		if (fstat(file_fd, &file_stat) < 0 || !S_ISREG(file_stat.st_mode)) {
+			response.status_code = HTTP_STATUS_NOT_FOUND;
+			goto finish;
+		}
+		file_size = file_stat.st_size;
 
-		file_content = calloc(1, file_size);
-		read(r_fd, file_content, file_size);
-		close(r_fd);
+		// file_content = calloc(1, file_size);
+		// read(r_fd, file_content, file_size);
+		// close(file_fd);
 
 		// fill response
 		response.status_code = HTTP_STATUS_OK;
 
-		response.body = file_content;
-		response.body_length = file_size;
+		response.body = NULL;     // we will stream it rather than pre-buffer it
+		response.body_length = 0; // = file_size
 
 		const char *content_type = get_content_type(file_path);
 		add_header(&response, "Content-Type", content_type);
-		
+
+		char lenbuf[32];
+		snprintf(lenbuf, sizeof lenbuf, "%lld", (long long)file_size);
+		add_header(&response, "Content-Length", lenbuf);
+
 		size_t ser_len;
-		
-finish:
+
+		off_t offset = 0;
+
+	finish:
+		// write status
 		strcpy(response.status_text, get_status_text(response.status_code));
-		char *serialized = serialize_response(&response, &ser_len);
 
-		write(clientfd, serialized, ser_len);
-		free(file_content);
-		free(serialized);
+		// serialize and send response
+		char *serialized = serialize_response_header(&response, &ser_len);
+		if (serialized) {
+			write(client_fd, serialized, ser_len); // write header -- isnt guaranteed to write to len but wont happen
+			free(serialized);
 
-		close(clientfd);
+			if (file_fd != -1) { // make sure there is a body so we dont serve trash
+				sendfile(client_fd, file_fd, &offset, file_size); // write body
+			}
+		}
+
+		close(file_fd);
+	cleanup:	
+		close(client_fd);
 	};
 
 	close(sockfd);
@@ -128,10 +172,10 @@ finish:
 }
 
 int main(void) {
-	if(listen_and_serve(PORT) < 0) {
-		perror("bruh");
+	if (listen_and_serve(PORT) < 0) {
+		LOG(LOG_ERROR, "server failed to start on port %d", PORT);
 		exit(1);
 	}
-	
+
 	return 0;
 }

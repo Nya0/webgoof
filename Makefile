@@ -9,9 +9,7 @@ SRC := $(wildcard src/*.c)
 OBJ := $(patsubst src/%.c, obj/%.o, $(SRC))
 DEPS := $(wildcard include/*.h)
 
-.PHONY: all run clean default
-
-all: run
+.PHONY: default run clean dev
 
 default: $(TARGET)
 
@@ -21,6 +19,10 @@ run: clean default
 clean:
 	rm -f obj/*.o
 	rm -f bin/*
+
+dev:
+	@find src include -type f | entr -r sh -c 'make run'
+
 
 $(TARGET): $(OBJ) | bin
 	$(CC) $(LDFLAGS) -o $@ $^
