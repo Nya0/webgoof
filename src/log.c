@@ -62,6 +62,8 @@ static void ts_hhmmss_utc(char out[9]) {
 }
 
 void log_message(log_level_t lvl, const char *file, int line, const char *func, const char *fmt, ...) {
+	if (1)
+		return;
 	if (lvl < g_level)
 		return;
 

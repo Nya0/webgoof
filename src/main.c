@@ -3,37 +3,39 @@
 
 #include <arpa/inet.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <netinet/in.h>
+#include <poll.h>
 #include <pthread.h>
 #include <signal.h>
+#include <stddef.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/epoll.h>
+#include <poll.h>
 #include <sys/sendfile.h>
 #include <sys/socket.h>
-#include <fcntl.h>
-#include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/uio.h>
 #include <time.h>
 #include <unistd.h>
 
-#define QUEUE_SIZE 128
 #define DEFAULT_PORT "3030"
 #define DEFAULT_WEB_ROOT "./public"
+#define DEFAULT_THREAD_COUNT "8"
 
+#define QUEUE_SIZE 4096
 #define CLIENT_REQ_SIZE 1024 * 4
 
-struct http_client {
-	int fd;
-	struct sockaddr_in addr;
-	socklen_t addr_len;
-
+struct worker {
+	int listen_fd;
+	int epfd;
 	char *web_root;
 };
 
-void *handle_client(void *args) {
-	struct http_client *client = args;
-	LOG(LOG_INFO, "client accepted %d", client->fd);
+void *handle_client(struct http_client *client) {
 	if (client->fd < 0) {
 		LOG(LOG_ERROR, "accept: %s", strerror(errno));
 		goto cleanup;
@@ -46,9 +48,25 @@ void *handle_client(void *args) {
 
 	char raw_request[CLIENT_REQ_SIZE] = {0};
 
-	ssize_t n = read(client->fd, raw_request, (size_t)CLIENT_REQ_SIZE - 1);
-	if (n <= 0) { // connection closed or error
-		goto cleanup;
+	ssize_t total_read = 0;
+	for (;;) {
+		ssize_t n = read(client->fd, raw_request + total_read, (size_t)CLIENT_REQ_SIZE - 1 - total_read);
+		if (n > 0) {
+			total_read += n;
+			if (total_read >= CLIENT_REQ_SIZE - 1)
+				break;
+			continue;
+		}
+
+		if (n == 0) {
+			goto cleanup;
+		}
+
+		if (n < 0) {
+			if (errno == EAGAIN || errno == EWOULDBLOCK)
+				break;    // drained
+			goto cleanup; // real error
+		};
 	}
 
 	struct http_request request = {0}; // zero init so logging is safe even if parse fails
@@ -62,12 +80,8 @@ void *handle_client(void *args) {
 		goto finish;
 	}
 
-	LOG(LOG_INFO, "%s %s (%s:%d)", http_method_str(request.method), request.path, client_ip, client_port);
 	for (int i = 0; i < request.header_count; i++) {
-		// LOG(LOG_DEBUG, "  %s: %s", request.headers[i].key, request.headers[i].value);
 	}
-
-	// char* file_content = NULL;
 
 	if (strstr(request.path, "..") != NULL) { // path traversal temp fix
 		LOG(LOG_WARN, "blocked path traversal attempt: %s (%s:%d)", request.path, client_ip, client_port);
@@ -86,7 +100,6 @@ void *handle_client(void *args) {
 	// open requested file
 	file_fd = open(file_path, O_RDONLY);
 	if (file_fd < 0) {
-		LOG(LOG_WARN, "open %s: %s", file_path, strerror(errno));
 
 		response.status_code = HTTP_STATUS_NOT_FOUND;
 		goto finish;
@@ -101,25 +114,22 @@ void *handle_client(void *args) {
 	file_size = file_stat.st_size;
 
 	// file_content = calloc(1, file_size);
-	// read(r_fd, file_content, file_size);
-	// close(file_fd);
+	// read(file_fd, file_content, file_size);
 
 	// fill response
 	response.status_code = HTTP_STATUS_OK;
 
-	response.body = NULL;     // we will stream it rather than pre-buffer it
-	response.body_length = 0; // = file_size
+	response.body = NULL;             // we will stream it rather than pre-buffer it
+	response.body_length = file_size; // = file_size
 
 	const char *content_type = get_content_type(file_path);
 	add_header(&response, "Content-Type", content_type);
 
 	char lenbuf[32];
-	snprintf(lenbuf, sizeof lenbuf, "%lld", (long long)file_size);
+	snprintf(lenbuf, sizeof lenbuf, "%lld", (long long)response.body_length);
 	add_header(&response, "Content-Length", lenbuf);
 
 	size_t ser_len;
-
-	off_t offset = 0;
 
 finish:
 	// write status
@@ -128,15 +138,40 @@ finish:
 	// serialize and send response
 	char *serialized = serialize_response_header(&response, &ser_len);
 	if (serialized) {
-		write(client->fd, serialized, ser_len); // write header -- isnt guaranteed to write to len but wont happen
-		free(serialized);
+		struct iovec iov[1] = {
+		    {.iov_base = serialized, .iov_len = ser_len},
+		};
+		writev(client->fd, iov, 1);
 
-		if (file_fd != -1) {                                   // make sure there is a body so we dont serve trash
-			sendfile(client->fd, file_fd, &offset, file_size); // write body
+		if (file_fd != -1) { // make sure there is a body so we dont serve trash
+			off_t offset = 0;
+			for (;;) {
+
+				ssize_t n = sendfile(client->fd, file_fd, &offset, file_size);
+				if (n > 0) {
+					if (offset >= file_size)
+						break;
+					continue;
+				}
+
+				if (n < 0) {
+					if (errno == EAGAIN) {
+						struct pollfd p = {.fd = client->fd, .events = POLLOUT};
+						poll(&p, 1, -1);
+						continue;
+					};
+					if (errno == EINTR)
+						continue;
+
+					break; // real error
+				};
+			}
+			close(file_fd);
 		}
+
+		free(serialized);
 	}
 
-	close(file_fd);
 cleanup:
 	close(client->fd);
 	free(client);
@@ -144,69 +179,122 @@ cleanup:
 	return 0;
 }
 
-int listen_and_serve(int port, char *web_root) {
-	signal(SIGPIPE, SIG_IGN);
-
-	log_init(stderr);
-
-	int sockfd = socket(AF_INET, SOCK_STREAM, 0);
-	if (sockfd < 0) {
-		LOG(LOG_ERROR, "socket: %s", strerror(errno));
+int set_nonblocking(int fd) {
+	int flags = fcntl(fd, F_GETFL, 0);
+	if (flags < 0)
 		return -1;
+	return fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+}
+
+void accept_all(struct worker *w) {
+	for (;;) {
+		struct http_client *client = calloc(1, sizeof(struct http_client));
+		client->web_root = w->web_root;
+		client->addr_len = sizeof(client->addr);
+		client->fd = accept4(w->listen_fd, (struct sockaddr *)&client->addr, &client->addr_len, SOCK_NONBLOCK);
+		if (client->fd < 0) {
+			free(client);
+			if (errno == EAGAIN || errno == EWOULDBLOCK)
+				break; // queue drained
+			if (errno == EINTR)
+				continue; // retry
+			break;
+		}
+		struct epoll_event ev;
+		ev.events = EPOLLIN | EPOLLET | EPOLLONESHOT;
+		ev.data.ptr = client;
+		epoll_ctl(w->epfd, EPOLL_CTL_ADD, client->fd, &ev);
 	}
+}
 
-	// option to allow us to immediately reuse port by bypassing the wait period
+void *worker_thread(void *arg) {
+	struct worker *w = arg;
+	struct epoll_event events[64];
+
+	struct epoll_event lev = {.events = EPOLLIN, .data.ptr = NULL}; // NULL tags "it's the listener"
+	epoll_ctl(w->epfd, EPOLL_CTL_ADD, w->listen_fd, &lev);
+
+	while (1) {
+		int n = epoll_wait(w->epfd, events, 64, -1);
+		for (int i = 0; i < n; i++) {
+			if (events[i].data.ptr == NULL) {
+				accept_all(w);
+			} else {
+				handle_client(events[i].data.ptr);
+			}
+		}
+	}
+}
+
+int make_listener(int port) {
+	int fd = socket(AF_INET, SOCK_STREAM, 0);
 	int opt = 1;
-	setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+	setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof opt);
+	setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof opt);
 
-	struct sockaddr_in server_addr = {0};
-	server_addr.sin_family = AF_INET;
-	server_addr.sin_addr.s_addr = INADDR_ANY;
-	server_addr.sin_port = htons(port);
+	struct sockaddr_in a = {0};
+	a.sin_family = AF_INET;
+	a.sin_addr.s_addr = INADDR_ANY;
+	a.sin_port = htons(port);
 
-	if (bind(sockfd, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
+	set_nonblocking(fd);
+
+	if (bind(fd, (struct sockaddr *)&a, sizeof(a)) < 0) {
 		LOG(LOG_ERROR, "bind to port %d: %s", port, strerror(errno));
 		return -1;
 	}
 
-	if (listen(sockfd, QUEUE_SIZE) < 0) {
+	if (listen(fd, QUEUE_SIZE) < 0) {
 		LOG(LOG_ERROR, "listen: %s", strerror(errno));
-		close(sockfd);
+		close(fd);
 		return -1;
 	}
+	return fd;
+}
 
-	LOG(LOG_INFO, "listening on http://localhost:%d (serving %s)", port, web_root);
+int listen_and_serve(int port, char *web_root, int thread_count) {
+	signal(SIGPIPE, SIG_IGN);
 
-	while (1) {
+	log_init(stderr);
+
+	for (int i = 0; i < thread_count; i++) {
+		struct worker *w = calloc(1, sizeof *w);
 		pthread_t thread;
+		w->epfd = epoll_create1(0);
+		w->listen_fd = make_listener(port);
+		if (w->listen_fd < 0) {
+			LOG(LOG_ERROR, "thread %d socket: %s", i, strerror(errno));
+			return -1;
+		}
+		w->web_root = web_root;
 
-		struct http_client *client = calloc(1, sizeof(struct http_client));
-		client->web_root = web_root;
-		client->addr_len = sizeof(client->addr);
-		client->fd = accept(sockfd, (struct sockaddr *)&client->addr, &client->addr_len);
-
-		pthread_create(&thread, NULL, handle_client, client);
+		pthread_create(&thread, NULL, worker_thread, w);
 		pthread_detach(thread);
-	};
+		LOG(LOG_INFO, "thread ready", port, web_root);
+	}
 
-	close(sockfd);
+	LOG(LOG_INFO, "listening on http://localhost:%d (serving %s with %d threads)", port, web_root, thread_count);
+	pause();
+
 	return 0;
 }
 
 typedef struct {
 	char *port;
 	char *web_root;
-} Options;
+	char *thread_count;
+} options;
 
-Options parse_args(int argc, char *argv[]) {
-	Options opts = {0};
+options parse_args(int argc, char *argv[]) {
+	options opts = {0};
 	int c;
 
 	// Set defaults
 	opts.port = DEFAULT_PORT;
 	opts.web_root = DEFAULT_WEB_ROOT;
+	opts.thread_count = DEFAULT_THREAD_COUNT;
 
-	while ((c = getopt(argc, argv, "hp:w:")) != -1) {
+	while ((c = getopt(argc, argv, "hp:w:t:")) != -1) {
 		switch (c) {
 		case 'p':
 			opts.port = optarg;
@@ -214,15 +302,19 @@ Options parse_args(int argc, char *argv[]) {
 		case 'w':
 			opts.web_root = optarg;
 			break;
+		case 't':
+			opts.thread_count = optarg;
+			break;
 		case 'h':
 			printf("Usage: %s [-p port] [-w web_root]\n", argv[0]);
 			printf("  -p port      Server port (default: %s)\n", DEFAULT_PORT);
 			printf("  -w web_root  Web root directory (default: %s)\n", DEFAULT_WEB_ROOT);
+			printf("  -t threads      Thread Count (default: %s)\n", DEFAULT_THREAD_COUNT);
 			printf("  -h           Show this help\n");
 			exit(EXIT_SUCCESS);
 		case '?':
 		default:
-			fprintf(stderr, "usage: %s [-p port] [-w web_root]\n", argv[0]);
+			fprintf(stderr, "usage: %s [-p port] [-w web_root] [-t threads]\n", argv[0]);
 			exit(EXIT_FAILURE);
 		}
 	}
@@ -231,11 +323,17 @@ Options parse_args(int argc, char *argv[]) {
 }
 
 int main(int argc, char *argv[]) {
-	Options opts = parse_args(argc, argv);
+	options opts = parse_args(argc, argv);
 
 	int port_num = atoi(opts.port);
 	if (port_num < 1 || port_num > 65535) {
 		LOG(LOG_ERROR, "invalid port: %s", opts.port);
+		exit(1);
+	}
+
+	int thread_count = atoi(opts.thread_count);
+	if (thread_count < 0) {
+		LOG(LOG_ERROR, "cant have 0 threads");
 		exit(1);
 	}
 
@@ -244,7 +342,7 @@ int main(int argc, char *argv[]) {
 		exit(1);
 	}
 
-	if (listen_and_serve(port_num, opts.web_root) < 0) {
+	if (listen_and_serve(port_num, opts.web_root, thread_count) < 0) {
 		LOG(LOG_ERROR, "server failed to start on port %d", opts.port);
 		exit(1);
 	}

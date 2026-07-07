@@ -1,4 +1,5 @@
 #pragma once
+#include <netinet/in.h>
 #include <stddef.h>
 
 #define HTTP_MAX_HEADERS 32
@@ -54,6 +55,14 @@ struct http_response {
 	int header_count;
 	char *body;
 	size_t body_length;
+};
+
+struct http_client {
+	int fd;
+	struct sockaddr_in addr;
+	socklen_t addr_len;
+
+	char *web_root;
 };
 
 int parse_request(char *raw_request, struct http_request *request);

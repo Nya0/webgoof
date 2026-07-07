@@ -1,4 +1,7 @@
+build/
+benchmarks/
+.vscode/
+
 obj
 bin
-build/
-.vscode/
+compile_commands.json
