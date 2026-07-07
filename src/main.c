@@ -49,27 +49,34 @@ void *handle_client(struct http_client *client) {
 
 	char raw_request[CLIENT_REQ_SIZE] = {0};
 
-	ssize_t total_read = 0;
-	for (;;) {
-		ssize_t n = read(client->fd, raw_request + total_read, (size_t)CLIENT_REQ_SIZE - 1 - total_read);
-		if (n > 0) {
-			total_read += n;
-			if (total_read >= CLIENT_REQ_SIZE - 1)
-				break;
-			continue;
-		}
+	// ssize_t total_read = 0;
+	// for (;;) {
+	// 	ssize_t n = read(client->fd, raw_request + total_read, (size_t)CLIENT_REQ_SIZE - 1 - total_read);
+	// 	LOG(LOG_ERROR, "total read: %u", total_read);
+	// 	LOG(LOG_ERROR, "n: %d", n);
+	// 	if (n > 0) {
+	// 		total_read += n;
+	// 		if (total_read >= CLIENT_REQ_SIZE - 1)
+	// 			break;
+	// 		continue;
+	// 	}
 
-		if (n == 0) {
-			goto cleanup;
-		}
+	// 	if (n == 0) {
+	// 		goto cleanup;
+	// 	}
+	// 	if (n < 0) {
+	// 		LOG(LOG_ERROR, "read error: %d", n);
+	// 		if (errno == EAGAIN || errno == EWOULDBLOCK)
+	// 			break;    // drained
+	// 		goto cleanup; // real error
+	// 	};
+	// }
 
-		if (n < 0) {
-			if (errno == EAGAIN || errno == EWOULDBLOCK)
-				break;    // drained
-			goto cleanup; // real error
-		};
-	}
-
+	ssize_t n = read(client->fd, raw_request, (size_t)CLIENT_REQ_SIZE - 1);
+	if (n < 0) {
+		LOG(LOG_ERROR, "read error: %d", n);
+		goto cleanup; // real error
+	};
 	struct http_request request = {0}; // zero init so logging is safe even if parse fails
 	struct http_response response = {0};
 
@@ -82,6 +89,7 @@ void *handle_client(struct http_client *client) {
 	}
 
 	for (int i = 0; i < request.header_count; i++) {
+		LOG(LOG_DEBUG, "  %s: %s", request.headers[i].key, request.headers[i].value);
 	}
 
 	if (strstr(request.path, "..") != NULL) { // path traversal temp fix
