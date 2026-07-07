@@ -15,7 +15,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/epoll.h>
-#include <poll.h>
 #include <sys/sendfile.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -130,6 +129,8 @@ void *handle_client(struct http_client *client) {
 		int cs = cache_insert(file_path, file_fd, file_size);
 		if (cs < 0) {
 			LOG(LOG_ERROR, "cache insert failed: %s", file_path);
+			close(file_fd); 
+			file_fd = -1;
 		}
 	} else {
 		file_fd = file->fd;
