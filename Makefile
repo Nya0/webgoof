@@ -17,7 +17,7 @@ ifeq ($(BUILD_TYPE), debug)
 	LDFLAGS += -fsanitize=address -fsanitize=undefined
 else ifeq ($(BUILD_TYPE), prod)
 	CC = musl-gcc
-	CFLAGS += $(PROD_FLAGS) -DLOG_LEVEL=1
+	CFLAGS += $(PROD_FLAGS) -DLOG_LEVEL=1 
 else ifeq ($(BUILD_TYPE), dev)
 	CFLAGS += $(DEBUG_FLAGS) -DLOG_LEVEL=4
 endif

@@ -1,5 +1,6 @@
 #include "http.h"
 #include "log.h"
+#include "cache.h"
 
 #include <arpa/inet.h>
 #include <errno.h>
@@ -97,22 +98,38 @@ void *handle_client(struct http_client *client) {
 		snprintf(file_path, sizeof(file_path), "%s%s", client->web_root, request.path);
 	}
 
-	// open requested file
-	file_fd = open(file_path, O_RDONLY);
-	if (file_fd < 0) {
+	// cache handling
+	struct cached_file *file = cache_lookup(file_path);
+	LOG(LOG_DEBUG, "file pointer: %p", file);
+	if (file == NULL) { // cache miss
+		LOG(LOG_ERROR, "cache miss: %s", file_path);
 
-		response.status_code = HTTP_STATUS_NOT_FOUND;
-		goto finish;
+		file_fd = open(file_path, O_RDONLY);
+		if (file_fd < 0) {
+
+			response.status_code = HTTP_STATUS_NOT_FOUND;
+			goto finish;
+		}
+
+		// read size
+		struct stat file_stat;
+		if (fstat(file_fd, &file_stat) < 0 || !S_ISREG(file_stat.st_mode)) {
+			response.status_code = HTTP_STATUS_NOT_FOUND;
+			goto finish;
+		}
+		file_size = file_stat.st_size;
+
+		int cs = cache_insert(file_path, file_fd, file_size);
+		if (cs < 0) {
+			LOG(LOG_ERROR, "cache insert failed: %s", file_path);
+		}
+	} else {
+		file_fd = file->fd;
+		file_size = file->size;
 	}
 
-	// read size
-	struct stat file_stat;
-	if (fstat(file_fd, &file_stat) < 0 || !S_ISREG(file_stat.st_mode)) {
-		response.status_code = HTTP_STATUS_NOT_FOUND;
-		goto finish;
-	}
-	file_size = file_stat.st_size;
-
+	
+	
 	// file_content = calloc(1, file_size);
 	// read(file_fd, file_content, file_size);
 
@@ -166,7 +183,6 @@ finish:
 					break; // real error
 				};
 			}
-			close(file_fd);
 		}
 
 		free(serialized);
@@ -255,8 +271,6 @@ int make_listener(int port) {
 int listen_and_serve(int port, char *web_root, int thread_count) {
 	signal(SIGPIPE, SIG_IGN);
 
-	log_init(stderr);
-
 	for (int i = 0; i < thread_count; i++) {
 		struct worker *w = calloc(1, sizeof *w);
 		pthread_t thread;
@@ -323,6 +337,9 @@ options parse_args(int argc, char *argv[]) {
 }
 
 int main(int argc, char *argv[]) {
+	log_init(stderr);
+	cache_init(100);
+
 	options opts = parse_args(argc, argv);
 
 	int port_num = atoi(opts.port);
