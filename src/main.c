@@ -45,7 +45,7 @@ void *handle_client(struct http_client *client) {
 	char client_ip[INET_ADDRSTRLEN] = {0};
 	inet_ntop(AF_INET, &client->addr.sin_addr, client_ip, sizeof(client_ip));
 
-	int client_port = ntohs(client->addr.sin_port);
+	in_port_t client_port = ntohs(client->addr.sin_port);
 
 	char raw_request[CLIENT_REQ_SIZE] = {0};
 
@@ -250,7 +250,7 @@ void *worker_thread(void *arg) {
 	}
 }
 
-int make_listener(int port) {
+int make_listener(in_port_t port) {
 	int fd = socket(AF_INET, SOCK_STREAM, 0);
 	if (fd < 0) {
 		return fd;
@@ -280,7 +280,7 @@ int make_listener(int port) {
 	return fd;
 }
 
-int listen_and_serve(int port, char *web_root, int thread_count) {
+int listen_and_serve(in_port_t port, char *web_root, int thread_count) {
 	signal(SIGPIPE, SIG_IGN);
 
 	for (int i = 0; i < thread_count; i++) {
@@ -360,7 +360,7 @@ int main(int argc, char *argv[]) {
 
 	options opts = parse_args(argc, argv);
 
-	int port_num = atoi(opts.port);
+	in_port_t port_num = atoi(opts.port);
 	if (port_num < 1 || port_num > 65535) {
 		LOG(LOG_ERROR, "invalid port: %s", opts.port);
 		exit(1);
