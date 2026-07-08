@@ -88,6 +88,7 @@ void *handle_client(struct http_client *client) {
 		goto finish;
 	}
 
+	LOG(LOG_INFO, "%s %s (%s:%d)", http_method_str(request.method), request.path, client_ip, client_port);
 	for (int i = 0; i < request.header_count; i++) {
 		LOG(LOG_DEBUG, "  %s: %s", request.headers[i].key, request.headers[i].value);
 	}
@@ -114,7 +115,7 @@ void *handle_client(struct http_client *client) {
 
 		file_fd = open(file_path, O_RDONLY);
 		if (file_fd < 0) {
-
+			LOG(LOG_WARN, "open %s: %s", file_path, strerror(errno));
 			response.status_code = HTTP_STATUS_NOT_FOUND;
 			goto finish;
 		}
@@ -199,7 +200,7 @@ finish:
 cleanup:
 	close(client->fd);
 	free(client);
-	LOG(LOG_WARN, "finished with client");
+	LOG(LOG_DEBUG, "finished with client");
 	return 0;
 }
 
