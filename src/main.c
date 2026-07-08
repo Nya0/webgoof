@@ -37,7 +37,7 @@ struct worker {
 };
 
 void *handle_client(struct http_client *client) {
-	if (client->fd < 0) {
+	if (client->fd == -1) {
 		LOG(LOG_ERROR, "accept: %s", strerror(errno));
 		goto cleanup;
 	}
@@ -64,7 +64,7 @@ void *handle_client(struct http_client *client) {
 	// 	if (n == 0) {
 	// 		goto cleanup;
 	// 	}
-	// 	if (n < 0) {
+	// 	if (n == -1) {
 	// 		LOG(LOG_ERROR, "read error: %d", n);
 	// 		if (errno == EAGAIN || errno == EWOULDBLOCK)
 	// 			break;    // drained
@@ -73,7 +73,7 @@ void *handle_client(struct http_client *client) {
 	// }
 
 	ssize_t n = read(client->fd, raw_request, (size_t)CLIENT_REQ_SIZE - 1);
-	if (n < 0) {
+	if (n == -1) {
 		LOG(LOG_ERROR, "read error: %d", n);
 		goto cleanup; // real error
 	};
@@ -83,7 +83,7 @@ void *handle_client(struct http_client *client) {
 	int file_fd = -1;
 	off_t file_size = 0;
 
-	if (parse_request(raw_request, &request) < 0) {
+	if (parse_request(raw_request, &request) == -1) {
 		response.status_code = HTTP_STATUS_BAD_REQUEST;
 		goto finish;
 	}
@@ -114,7 +114,7 @@ void *handle_client(struct http_client *client) {
 		LOG(LOG_ERROR, "cache miss: %s", file_path);
 
 		file_fd = open(file_path, O_RDONLY);
-		if (file_fd < 0) {
+		if (file_fd == -1) {
 			LOG(LOG_WARN, "open %s: %s", file_path, strerror(errno));
 			response.status_code = HTTP_STATUS_NOT_FOUND;
 			goto finish;
@@ -129,7 +129,7 @@ void *handle_client(struct http_client *client) {
 		file_size = file_stat.st_size;
 
 		int cs = cache_insert(file_path, file_fd, file_size);
-		if (cs < 0) {
+		if (cs == -1) {
 			LOG(LOG_ERROR, "cache insert failed: %s", file_path);
 			close(file_fd);
 			file_fd = -1;
@@ -180,7 +180,7 @@ finish:
 					continue;
 				}
 
-				if (n < 0) {
+				if (n == -1) {
 					if (errno == EAGAIN) {
 						struct pollfd p = {.fd = client->fd, .events = POLLOUT};
 						poll(&p, 1, -1);
@@ -217,7 +217,7 @@ void accept_all(struct worker *w) {
 		client->web_root = w->web_root;
 		client->addr_len = sizeof(client->addr);
 		client->fd = accept4(w->listen_fd, (struct sockaddr *)&client->addr, &client->addr_len, SOCK_NONBLOCK);
-		if (client->fd < 0) {
+		if (client->fd == -1) {
 			free(client);
 			if (errno == EAGAIN || errno == EWOULDBLOCK)
 				break; // queue drained
@@ -253,7 +253,7 @@ void *worker_thread(void *arg) {
 
 int make_listener(in_port_t port) {
 	int fd = socket(AF_INET, SOCK_STREAM, 0);
-	if (fd < 0) {
+	if (fd == -1) {
 		return fd;
 	}
 
@@ -268,12 +268,12 @@ int make_listener(in_port_t port) {
 
 	set_nonblocking(fd);
 
-	if (bind(fd, (struct sockaddr *)&a, sizeof(a)) < 0) {
+	if (bind(fd, (struct sockaddr *)&a, sizeof(a)) == -1) {
 		LOG(LOG_ERROR, "bind to port %d: %s", port, strerror(errno));
 		return -1;
 	}
 
-	if (listen(fd, QUEUE_SIZE) < 0) {
+	if (listen(fd, QUEUE_SIZE) == -1) {
 		LOG(LOG_ERROR, "listen: %s", strerror(errno));
 		close(fd);
 		return -1;
@@ -289,7 +289,7 @@ int listen_and_serve(in_port_t port, char *web_root, int thread_count) {
 		pthread_t thread;
 		w->epfd = epoll_create1(0);
 		w->listen_fd = make_listener(port);
-		if (w->listen_fd < 0) {
+		if (w->listen_fd == -1) {
 			LOG(LOG_ERROR, "thread %d socket: %s", i, strerror(errno));
 			return -1;
 		}
@@ -368,7 +368,7 @@ int main(int argc, char *argv[]) {
 	}
 
 	int thread_count = atoi(opts.thread_count);
-	if (thread_count < 0) {
+	if (thread_count == -1) {
 		LOG(LOG_ERROR, "cant have 0 threads");
 		exit(1);
 	}
@@ -380,12 +380,12 @@ int main(int argc, char *argv[]) {
 	}
 	log_set_verbosity((log_level_t)verbosity);
 
-	if (access(opts.web_root, R_OK | X_OK) < 0) { // list dir | open files inside
+	if (access(opts.web_root, R_OK | X_OK) == -1) { // list dir | open files inside
 		LOG(LOG_ERROR, "web_root not accessible: %s", opts.web_root);
 		exit(1);
 	}
 
-	if (listen_and_serve(port_num, opts.web_root, thread_count) < 0) {
+	if (listen_and_serve(port_num, opts.web_root, thread_count) == -1) {
 		LOG(LOG_ERROR, "server failed to start on port %d", opts.port);
 		exit(1);
 	}

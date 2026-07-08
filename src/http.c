@@ -145,7 +145,7 @@ char *serialize_response_header(struct http_response *response, size_t *out_len)
 
 	// status
 	n = append_fmt(header_buffer, sizeof(header_buffer), header_len, "HTTP/1.0 %d %s\r\n", response->status_code, response->status_text);
-	if (n < 0) {
+	if (n == -1) {
 		LOG(LOG_ERROR, "response header too large to serialize");
 		return NULL;
 	}
@@ -154,7 +154,7 @@ char *serialize_response_header(struct http_response *response, size_t *out_len)
 	// headers
 	for (int i = 0; i < response->header_count; i++) {
 		n = append_fmt(header_buffer, sizeof(header_buffer), header_len, "%s: %s\r\n", response->headers[i].key, response->headers[i].value);
-		if (n < 0) {
+		if (n == -1) {
 			LOG(LOG_ERROR, "response header too large to serialize");
 			return NULL;
 		}
@@ -163,7 +163,7 @@ char *serialize_response_header(struct http_response *response, size_t *out_len)
 
 	// indicate end of header
 	n = append_fmt(header_buffer, sizeof(header_buffer), header_len, "\r\n");
-	if (n < 0) {
+	if (n == -1) {
 		LOG(LOG_ERROR, "response header too large to serialize");
 		return NULL;
 	}
