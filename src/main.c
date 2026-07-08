@@ -24,7 +24,7 @@
 
 #define DEFAULT_PORT "3030"
 #define DEFAULT_WEB_ROOT "./public"
-#define DEFAULT_THREAD_COUNT "8"
+#define DEFAULT_THREAD_COUNT "4"
 #define DEFAULT_VERBOSITY "4" // LOG_DEBUG
 
 #define QUEUE_SIZE 4096
@@ -333,16 +333,16 @@ options parse_args(int argc, char *argv[]) {
 			opts.verbosity = optarg;
 			break;
 		case 'h':
-			printf("Usage: %s [-p port] [-w web_root]\n", argv[0]);
-			printf("  -p port      Server port (default: %s)\n", DEFAULT_PORT);
+			printf("Usage: %s [-w web_root] [-p port] [-t threads] [-v level]\n", argv[0]);
 			printf("  -w web_root  Web root directory (default: %s)\n", DEFAULT_WEB_ROOT);
+			printf("  -p port      Server port (default: %s)\n", DEFAULT_PORT);
 			printf("  -t threads   Thread Count (default: %s)\n", DEFAULT_THREAD_COUNT);
-			printf("  -v           Verbosity level (default: 1:ERROR) (0:NONE, 1:ERROR, 2:WARN, 3:INFO, 4:DEBUG\n");
+			printf("  -v           Verbosity level (default: %s) (0:NONE, 1:ERROR, 2:WARN, 3:INFO, 4:DEBUG)\n", DEFAULT_VERBOSITY);
 			printf("  -h           Show this help\n");
 			exit(EXIT_SUCCESS);
 		case '?':
 		default:
-			fprintf(stderr, "usage: %s [-p port] [-w web_root] [-t threads]\n", argv[0]);
+			fprintf(stderr, "Try '%s -h' for more information.\n", argv[0]);
 			exit(EXIT_FAILURE);
 		}
 	}
