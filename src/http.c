@@ -13,7 +13,7 @@
 #include <time.h>
 #include <unistd.h>
 
-http_method_t parse_method(const char *method_str) {
+static http_method_t parse_method(const char *method_str) {
 	if (strcmp(method_str, "GET") == 0) {
 		return HTTP_GET;
 	}

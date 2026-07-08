@@ -66,7 +66,7 @@ struct http_client {
 };
 
 static http_method_t parse_method(const char *method_str);
-static const char *http_method_str(http_method_t method);
+const char *http_method_str(http_method_t method);
 int parse_request(char *raw_request, struct http_request *request);
 int add_header(struct http_response *response, const char *key, const char *value);
 char *serialize_response_header(struct http_response *response, size_t *out_len);
