@@ -1,4 +1,3 @@
-// log.c
 #include "log.h"
 #include <pthread.h>
 #include <stdarg.h>
@@ -9,7 +8,7 @@
 #define COLOR_RESET "\033[0m"
 
 static FILE *g_out;
-static log_level_t g_level = LOG_DEBUG;
+static log_level_t g_verbosity = LOG_LEVEL;
 static int g_use_color = 0;
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
 
@@ -19,10 +18,12 @@ void log_init(FILE *out) {
 	g_use_color = isatty(fileno(g_out)) && getenv("NO_COLOR") == NULL;
 }
 
-void log_set_level(log_level_t lvl) { g_level = lvl; }
+void log_set_verbosity(log_level_t max) { g_verbosity = max; }
 
 static const char *level_str(log_level_t lvl) {
 	switch (lvl) {
+	case LOG_NONE:
+		break;
 	case LOG_DEBUG:
 		return "DEBUG";
 	case LOG_INFO:
@@ -38,6 +39,8 @@ static const char *level_str(log_level_t lvl) {
 
 static const char *level_color(log_level_t lvl) {
 	switch (lvl) {
+	case LOG_NONE:
+		break;
 	case LOG_DEBUG:
 		return "\033[36m"; // cyan
 	case LOG_INFO:
@@ -61,9 +64,7 @@ static void ts_hhmmss_utc(char out[9]) {
 }
 
 void log_message(log_level_t lvl, const char *file, int line, const char *func, const char *fmt, ...) {
-	if (1)
-		return;
-	if (lvl < g_level)
+	if (lvl > g_verbosity)
 		return;
 
 	char ts[9];

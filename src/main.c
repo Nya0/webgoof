@@ -1,6 +1,6 @@
+#include "cache.h"
 #include "http.h"
 #include "log.h"
-#include "cache.h"
 
 #include <arpa/inet.h>
 #include <errno.h>
@@ -25,6 +25,7 @@
 #define DEFAULT_PORT "3030"
 #define DEFAULT_WEB_ROOT "./public"
 #define DEFAULT_THREAD_COUNT "8"
+#define DEFAULT_VERBOSITY "4" // LOG_DEBUG
 
 #define QUEUE_SIZE 4096
 #define CLIENT_REQ_SIZE 1024 * 4
@@ -129,7 +130,7 @@ void *handle_client(struct http_client *client) {
 		int cs = cache_insert(file_path, file_fd, file_size);
 		if (cs < 0) {
 			LOG(LOG_ERROR, "cache insert failed: %s", file_path);
-			close(file_fd); 
+			close(file_fd);
 			file_fd = -1;
 		}
 	} else {
@@ -137,8 +138,6 @@ void *handle_client(struct http_client *client) {
 		file_size = file->size;
 	}
 
-	
-	
 	// file_content = calloc(1, file_size);
 	// read(file_fd, file_content, file_size);
 
@@ -293,7 +292,7 @@ int listen_and_serve(int port, char *web_root, int thread_count) {
 
 		pthread_create(&thread, NULL, worker_thread, w);
 		pthread_detach(thread);
-		LOG(LOG_INFO, "thread ready", port, web_root);
+		LOG(LOG_DEBUG, "thread (%d) ready", i);
 	}
 
 	LOG(LOG_INFO, "listening on http://localhost:%d (serving %s with %d threads)", port, web_root, thread_count);
@@ -306,6 +305,7 @@ typedef struct {
 	char *port;
 	char *web_root;
 	char *thread_count;
+	char *verbosity;
 } options;
 
 options parse_args(int argc, char *argv[]) {
@@ -316,8 +316,9 @@ options parse_args(int argc, char *argv[]) {
 	opts.port = DEFAULT_PORT;
 	opts.web_root = DEFAULT_WEB_ROOT;
 	opts.thread_count = DEFAULT_THREAD_COUNT;
+	opts.verbosity = DEFAULT_VERBOSITY;
 
-	while ((c = getopt(argc, argv, "hp:w:t:")) != -1) {
+	while ((c = getopt(argc, argv, "hp:w:t:v:")) != -1) {
 		switch (c) {
 		case 'p':
 			opts.port = optarg;
@@ -328,11 +329,15 @@ options parse_args(int argc, char *argv[]) {
 		case 't':
 			opts.thread_count = optarg;
 			break;
+		case 'v':
+			opts.verbosity = optarg;
+			break;
 		case 'h':
 			printf("Usage: %s [-p port] [-w web_root]\n", argv[0]);
 			printf("  -p port      Server port (default: %s)\n", DEFAULT_PORT);
 			printf("  -w web_root  Web root directory (default: %s)\n", DEFAULT_WEB_ROOT);
-			printf("  -t threads      Thread Count (default: %s)\n", DEFAULT_THREAD_COUNT);
+			printf("  -t threads   Thread Count (default: %s)\n", DEFAULT_THREAD_COUNT);
+			printf("  -v           Verbosity level (default: 1:ERROR) (0:NONE, 1:ERROR, 2:WARN, 3:INFO, 4:DEBUG\n");
 			printf("  -h           Show this help\n");
 			exit(EXIT_SUCCESS);
 		case '?':
@@ -362,6 +367,13 @@ int main(int argc, char *argv[]) {
 		LOG(LOG_ERROR, "cant have 0 threads");
 		exit(1);
 	}
+
+	int verbosity = atoi(opts.verbosity);
+	if (verbosity < LOG_NONE || verbosity > LOG_DEBUG) {
+		LOG(LOG_ERROR, "log level must be within range (0:NONE, 1:ERROR, 2:WARN, 3:INFO, 4:DEBUG)");
+		exit(1);
+	}
+	log_set_verbosity((log_level_t)verbosity);
 
 	if (access(opts.web_root, R_OK | X_OK) < 0) { // list dir | open files inside
 		LOG(LOG_ERROR, "web_root not accessible: %s", opts.web_root);

@@ -17,9 +17,9 @@ ifeq ($(BUILD_TYPE), debug)
 	LDFLAGS += -fsanitize=address -fsanitize=undefined
 else ifeq ($(BUILD_TYPE), prod)
 	CC = musl-gcc
-	CFLAGS += $(PROD_FLAGS) -DLOG_LEVEL=1 
+	CFLAGS += $(PROD_FLAGS) -DLOG_LEVEL=0
 else ifeq ($(BUILD_TYPE), dev)
-	CFLAGS += $(DEBUG_FLAGS) -DLOG_LEVEL=4
+	CFLAGS += $(DEBUG_FLAGS)
 endif
 
 TARGET := bin/http-server
@@ -36,7 +36,7 @@ debug:
 	@BUILD_TYPE=debug make $(TARGET)
 	@echo "Debug build complete"
 
-prod:
+prod: 
 	@make clean
 	@BUILD_TYPE=prod make $(TARGET)
 	@echo "Production build complete"
