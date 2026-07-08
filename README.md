@@ -9,7 +9,21 @@ simple webserver built for fun and learning.
 
 - handles basic HTTP/1.0 requests
 - serves static files
+- multi-threaded
+- responds mostly
 - thats about it
+
+## Usage
+
+```
+# http-server -h
+Usage: http-server [-w web_root] [-p port] [-t threads] [-v level]
+  -w web_root  Web root directory (default: ./public)
+  -p port      Server port (default: 3030)
+  -t threads   Thread Count (default: 4)
+  -v           Verbosity level (default: 4) (0:NONE, 1:ERROR, 2:WARN, 3:INFO, 4:DEBUG)
+  -h           Show this help
+```
 
 ## Running
 
