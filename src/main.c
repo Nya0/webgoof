@@ -252,6 +252,10 @@ void *worker_thread(void *arg) {
 
 int make_listener(int port) {
 	int fd = socket(AF_INET, SOCK_STREAM, 0);
+	if (fd < 0) {
+		return fd;
+	}
+
 	int opt = 1;
 	setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof opt);
 	setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof opt);
