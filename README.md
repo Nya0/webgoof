@@ -22,5 +22,11 @@ curl -v http://localhost:3030/
 ```
 ## TODO
 - [x] http/1.0
+- [x] multi-threading
+- [x] cache files
+- [ ] logs on their own thing
+- [ ] cache lru cleaning
+- [ ] update cache on file update
+- [ ] cache common responses
 - [ ] cleanup the code
 - [ ] http/1.1
