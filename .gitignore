@@ -7,3 +7,4 @@ bin
 compile_commands.json
 perf*
 profile.sh
+1gb.bin

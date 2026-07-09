@@ -9,6 +9,7 @@
 #include <poll.h>
 #include <pthread.h>
 #include <signal.h>
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -83,8 +84,10 @@ void *handle_client(struct http_client *client) {
 	struct http_request request = {0}; // zero init so logging is safe even if parse fails
 	struct http_response response = {0};
 
+	int file_fd = -1;
 	char *file_content = NULL;
 	off_t file_size = 0;
+	bool large_file = false;
 
 	if (parse_request(raw_request, &request) == -1) {
 		response.status_code = HTTP_STATUS_BAD_REQUEST;
@@ -111,12 +114,12 @@ void *handle_client(struct http_client *client) {
 	}
 
 	//-- handling request
-	struct cached_file *file = cache_lookup(file_path);
-	LOG(LOG_DEBUG, "file pointer: %p", file);
-	if (file == NULL) { // cache miss
-		LOG(LOG_ERROR, "cache miss: %s", file_path);
+	struct cached_file *file_hit = cache_lookup(file_path);
+	LOG(LOG_DEBUG, "file pointer: %p", file_hit);
+	if (file_hit == NULL) { // cache miss
+		LOG(LOG_WARN, "cache miss: %s", file_path);
 
-		int file_fd = open(file_path, O_RDONLY);
+		file_fd = open(file_path, O_RDONLY);
 		if (file_fd == -1) {
 			LOG(LOG_WARN, "open %s: %s", file_path, strerror(errno));
 			response.status_code = HTTP_STATUS_NOT_FOUND;
@@ -131,6 +134,13 @@ void *handle_client(struct http_client *client) {
 			goto finish;
 		}
 		file_size = file_stat.st_size;
+
+		// if file bigger than 8mb mark it and skip reading
+		if (file_size > (1 << 23)) { // 2^23 (8mb)
+			large_file = true;
+			LOG(LOG_DEBUG, "(%s) using large_file mode", file_path);
+			goto filler;
+		}
 
 		file_content = malloc(file_size);
 		if (file_content == NULL) {
@@ -163,7 +173,6 @@ void *handle_client(struct http_client *client) {
 			goto finish;
 		}
 
-		
 		if (cache_insert(file_path, file_content, file_size) == -1) {
 			LOG(LOG_ERROR, "cache insert failed: %s", file_path);
 			free(file_content);
@@ -172,14 +181,14 @@ void *handle_client(struct http_client *client) {
 			goto finish;
 		}
 	} else { // cache hit
-		file_content = file->content;
-		file_size = file->size;
+		file_content = file_hit->content;
+		file_size = file_hit->size;
 	}
 
-	//-- fill success response
+filler: 
 	response.status_code = HTTP_STATUS_OK;
 
-	response.body = NULL; // we will stream it with sendfile rather than pre-buffer it
+	response.body = file_content;
 	response.body_length = file_size;
 
 	const char *content_type = get_content_type(file_path);
@@ -200,14 +209,43 @@ finish: {
 	if (serialized) {
 		struct iovec iov[2];
 		int iovcnt = 0;
+
 		iov[iovcnt++] = (struct iovec){.iov_base = serialized, .iov_len = ser_len};
-		
-		if (file_content != NULL) { // there is file_content
+
+		if (file_content != NULL) { // there is content
 			iov[iovcnt++] = (struct iovec){.iov_base = file_content, .iov_len = file_size};
 		}
-		ssize_t w = writev(client->fd, iov, iovcnt);
 
+		ssize_t w = writev(client->fd, iov, iovcnt);
 		LOG(LOG_DEBUG, "written %li", w);
+
+		if (large_file == true) { // file is large use sendfile
+			if (file_fd == -1) {
+				LOG(LOG_ERROR, "literally impossiblr?? how");
+			}
+			off_t offset = 0;
+			for (;;) {
+
+				ssize_t n = sendfile(client->fd, file_fd, &offset, file_size);
+				if (n > 0) {
+					if (offset >= file_size)
+						break;
+					continue;
+				}
+
+				if (n == -1) {
+					if (errno == EAGAIN) {
+						struct pollfd p = {.fd = client->fd, .events = POLLOUT};
+						poll(&p, 1, -1); // wait so we can send the rest of the file
+						continue;
+					};
+					if (errno == EINTR)
+						continue;
+					break; // real error
+				};
+			}
+		}
+
 		free(serialized);
 	}
 }
@@ -218,6 +256,7 @@ cleanup: {
 	LOG(LOG_DEBUG, "finished with client");
 	return 0;
 }
+	
 }
 
 int set_nonblocking(int fd) {
