@@ -39,7 +39,7 @@ struct worker {
 	char *web_root;
 };
 
-void *handle_client(struct http_client *client) {
+int handle_client(struct http_client *client) {
 
 	//-- get ip
 	char client_ip[INET_ADDRSTRLEN];
@@ -73,12 +73,15 @@ void *handle_client(struct http_client *client) {
 	// }
 
 	ssize_t n = read(client->fd, raw_request, (size_t)CLIENT_REQ_SIZE - 1);
-	raw_request[n] = '\0'; // null-terminate string
-
+	if (n == 0)
+		return -1; // EOF client closed
 	if (n == -1) {
-		LOG(LOG_ERROR, "read error: %d", n);
-		goto cleanup;
-	};
+		if (errno == EAGAIN || errno == EWOULDBLOCK)
+			return 0; 
+		return -1;   
+	}
+
+	raw_request[n] = '\0'; // null-terminate string
 
 	//-- parsing raw req
 	struct http_request request = {0}; // zero init so logging is safe even if parse fails
@@ -185,7 +188,7 @@ void *handle_client(struct http_client *client) {
 		file_size = file_hit->size;
 	}
 
-filler: 
+filler:
 	response.status_code = HTTP_STATUS_OK;
 
 	response.body = file_content;
@@ -197,6 +200,7 @@ filler:
 	char lenbuf[32];
 	snprintf(lenbuf, sizeof lenbuf, "%lld", (long long)response.body_length);
 	add_header(&response, "Content-Length", lenbuf);
+	add_header(&response, "Connection", "keep-alive");
 
 finish: {
 
@@ -212,17 +216,15 @@ finish: {
 
 		iov[iovcnt++] = (struct iovec){.iov_base = serialized, .iov_len = ser_len};
 
-		if (file_content != NULL) { // there is content
+		if (file_content != NULL) { // there is content (alt is large file path)
 			iov[iovcnt++] = (struct iovec){.iov_base = file_content, .iov_len = file_size};
 		}
 
 		ssize_t w = writev(client->fd, iov, iovcnt);
 		LOG(LOG_DEBUG, "written %li", w);
 
-		if (large_file == true) { // file is large use sendfile
-			if (file_fd == -1) {
-				LOG(LOG_ERROR, "literally impossiblr?? how");
-			}
+		//-- handle large files
+		if (large_file) {
 			off_t offset = 0;
 			for (;;) {
 
@@ -244,6 +246,7 @@ finish: {
 					break; // real error
 				};
 			}
+			close(file_fd);
 		}
 
 		free(serialized);
@@ -251,12 +254,11 @@ finish: {
 }
 
 cleanup: {
-	close(client->fd);
-	free(client);
+	// close(client->fd);
+	// free(client);
 	LOG(LOG_DEBUG, "finished with client");
 	return 0;
 }
-	
 }
 
 int set_nonblocking(int fd) {
@@ -304,7 +306,20 @@ void *worker_thread(void *arg) {
 			if (events[i].data.ptr == NULL) {
 				accept_all(w);
 			} else {
-				handle_client(events[i].data.ptr);
+				struct http_client *client = (struct http_client *)events[i].data.ptr;
+
+				struct epoll_event ev;
+				ev.events = EPOLLIN | EPOLLET | EPOLLONESHOT;
+				ev.data.ptr = client;
+
+				if (handle_client(client) == -1) {
+					close(client->fd);
+					free(client);
+					LOG(LOG_DEBUG, "client disconnected");
+					continue;
+				}
+
+				epoll_ctl(w->epfd, EPOLL_CTL_MOD, client->fd, &ev);
 			}
 		}
 	}

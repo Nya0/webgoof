@@ -144,7 +144,7 @@ char *serialize_response_header(struct http_response *response, size_t *out_len)
 	int n;
 
 	// status
-	n = append_fmt(header_buffer, sizeof(header_buffer), header_len, "HTTP/1.0 %d %s\r\n", response->status_code, response->status_text);
+	n = append_fmt(header_buffer, sizeof(header_buffer), header_len, "HTTP/1.1 %d %s\r\n", response->status_code, response->status_text);
 	if (n == -1) {
 		LOG(LOG_ERROR, "response header too large to serialize");
 		return NULL;
