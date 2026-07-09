@@ -15,6 +15,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/epoll.h>
+#include <sys/resource.h>
 #include <sys/sendfile.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -37,17 +38,14 @@ struct worker {
 };
 
 void *handle_client(struct http_client *client) {
-	if (client->fd == -1) {
-		LOG(LOG_ERROR, "accept: %s", strerror(errno));
-		goto cleanup;
-	}
 
-	char client_ip[INET_ADDRSTRLEN] = {0};
+	//-- get ip
+	char client_ip[INET_ADDRSTRLEN];
 	inet_ntop(AF_INET, &client->addr.sin_addr, client_ip, sizeof(client_ip));
-
 	in_port_t client_port = ntohs(client->addr.sin_port);
 
-	char raw_request[CLIENT_REQ_SIZE] = {0};
+	//-- reading request
+	char raw_request[CLIENT_REQ_SIZE];
 
 	// ssize_t total_read = 0;
 	// for (;;) {
@@ -73,10 +71,14 @@ void *handle_client(struct http_client *client) {
 	// }
 
 	ssize_t n = read(client->fd, raw_request, (size_t)CLIENT_REQ_SIZE - 1);
+	raw_request[n] = '\0'; // null-terminate string
+
 	if (n == -1) {
 		LOG(LOG_ERROR, "read error: %d", n);
-		goto cleanup; // real error
+		goto cleanup;
 	};
+
+	//-- parsing raw req
 	struct http_request request = {0}; // zero init so logging is safe even if parse fails
 	struct http_response response = {0};
 
@@ -107,7 +109,7 @@ void *handle_client(struct http_client *client) {
 		snprintf(file_path, sizeof(file_path), "%s%s", client->web_root, request.path);
 	}
 
-	// cache handling
+	//-- handling request
 	struct cached_file *file = cache_lookup(file_path);
 	LOG(LOG_DEBUG, "file pointer: %p", file);
 	if (file == NULL) { // cache miss
@@ -134,19 +136,16 @@ void *handle_client(struct http_client *client) {
 			close(file_fd);
 			file_fd = -1;
 		}
-	} else {
+	} else { // cache hit
 		file_fd = file->fd;
 		file_size = file->size;
 	}
 
-	// file_content = calloc(1, file_size);
-	// read(file_fd, file_content, file_size);
-
-	// fill response
+	//-- fill success response
 	response.status_code = HTTP_STATUS_OK;
 
-	response.body = NULL;             // we will stream it rather than pre-buffer it
-	response.body_length = file_size; // = file_size
+	response.body = NULL; // we will stream it with sendfile rather than pre-buffer it
+	response.body_length = file_size;
 
 	const char *content_type = get_content_type(file_path);
 	add_header(&response, "Content-Type", content_type);
@@ -155,13 +154,13 @@ void *handle_client(struct http_client *client) {
 	snprintf(lenbuf, sizeof lenbuf, "%lld", (long long)response.body_length);
 	add_header(&response, "Content-Length", lenbuf);
 
-	size_t ser_len;
-
-finish:
-	// write status
+finish: {
+	
+	// write status text from status code
 	strcpy(response.status_text, get_status_text(response.status_code));
-
+	
 	// serialize and send response
+	size_t ser_len;
 	char *serialized = serialize_response_header(&response, &ser_len);
 	if (serialized) {
 		struct iovec iov[1] = {
@@ -183,12 +182,11 @@ finish:
 				if (n == -1) {
 					if (errno == EAGAIN) {
 						struct pollfd p = {.fd = client->fd, .events = POLLOUT};
-						poll(&p, 1, -1);
+						poll(&p, 1, -1); // wait so we can send the rest of the file
 						continue;
 					};
 					if (errno == EINTR)
 						continue;
-
 					break; // real error
 				};
 			}
@@ -196,12 +194,15 @@ finish:
 
 		free(serialized);
 	}
-
-cleanup:
+}
+	
+cleanup: {
 	close(client->fd);
 	free(client);
 	LOG(LOG_DEBUG, "finished with client");
 	return 0;
+}
+	
 }
 
 int set_nonblocking(int fd) {
@@ -213,21 +214,25 @@ int set_nonblocking(int fd) {
 
 void accept_all(struct worker *w) {
 	for (;;) {
-		struct http_client *client = calloc(1, sizeof(struct http_client));
+		
+		struct http_client *client = malloc(sizeof(struct http_client)); // TODO: syscalls - zero-copy (maybe fine if we switch to keep-alive someday)
+		socklen_t addr_len = sizeof(client->addr);
 		client->web_root = w->web_root;
-		client->addr_len = sizeof(client->addr);
-		client->fd = accept4(w->listen_fd, (struct sockaddr *)&client->addr, &client->addr_len, SOCK_NONBLOCK);
+		client->fd = accept4(w->listen_fd, (struct sockaddr *)&client->addr, &addr_len, SOCK_NONBLOCK);
 		if (client->fd == -1) {
 			free(client);
+
 			if (errno == EAGAIN || errno == EWOULDBLOCK)
 				break; // queue drained
 			if (errno == EINTR)
-				continue; // retry
+				continue; // interrupted mid accept, retry
 			break;
 		}
+
 		struct epoll_event ev;
 		ev.events = EPOLLIN | EPOLLET | EPOLLONESHOT;
 		ev.data.ptr = client;
+
 		epoll_ctl(w->epfd, EPOLL_CTL_ADD, client->fd, &ev);
 	}
 }
@@ -254,6 +259,7 @@ void *worker_thread(void *arg) {
 int make_listener(in_port_t port) {
 	int fd = socket(AF_INET, SOCK_STREAM, 0);
 	if (fd == -1) {
+		LOG(LOG_ERROR, "create socket: %s", port, strerror(errno));
 		return fd;
 	}
 
@@ -282,21 +288,26 @@ int make_listener(in_port_t port) {
 }
 
 int listen_and_serve(in_port_t port, char *web_root, int thread_count) {
-	signal(SIGPIPE, SIG_IGN);
+	signal(SIGPIPE, SIG_IGN); // stop a broken client from closing the server
 
 	for (int i = 0; i < thread_count; i++) {
-		struct worker *w = calloc(1, sizeof *w);
 		pthread_t thread;
+
+		struct worker *w = calloc(1, sizeof *w);
 		w->epfd = epoll_create1(0);
 		w->listen_fd = make_listener(port);
 		if (w->listen_fd == -1) {
-			LOG(LOG_ERROR, "thread %d socket: %s", i, strerror(errno));
+			LOG(LOG_ERROR, "thread (%d) socket: %s", i, strerror(errno));
 			return -1;
 		}
 		w->web_root = web_root;
 
-		pthread_create(&thread, NULL, worker_thread, w);
+		if (pthread_create(&thread, NULL, worker_thread, w) == -1) {
+			LOG(LOG_DEBUG, "thread (%d) creation: %s", i, strerror(errno));
+			exit(1);
+		}
 		pthread_detach(thread);
+
 		LOG(LOG_DEBUG, "thread (%d) ready", i);
 	}
 
@@ -361,32 +372,45 @@ int main(int argc, char *argv[]) {
 
 	options opts = parse_args(argc, argv);
 
-	in_port_t port_num = atoi(opts.port);
-	if (port_num < 1 || port_num > 65535) {
-		LOG(LOG_ERROR, "invalid port: %s", opts.port);
+	printf("\033[31m"); // red color for error area
+
+	struct rlimit limit = {0};
+	if (getrlimit(RLIMIT_NPROC, &limit) == -1) {
+		printf("failed to get system thread limit");
 		exit(1);
 	}
 
-	int thread_count = atoi(opts.thread_count);
-	if (thread_count == -1) {
-		LOG(LOG_ERROR, "cant have 0 threads");
+	int port_input = atoi(opts.port);
+	if (port_input < 1 || port_input > 65535) {
+		printf("invalid port: %s\n", opts.port);
+		fflush(stderr);
+		exit(1);
+	}
+	in_port_t port_num = (in_port_t)port_input;
+
+	uint16_t thread_count = atoi(opts.thread_count);
+	if (thread_count < 1 || thread_count > limit.rlim_cur) {
+		printf("thread range 1-%lu\n", limit.rlim_cur);
 		exit(1);
 	}
 
 	int verbosity = atoi(opts.verbosity);
 	if (verbosity < LOG_NONE || verbosity > LOG_DEBUG) {
-		LOG(LOG_ERROR, "log level must be within range (0:NONE, 1:ERROR, 2:WARN, 3:INFO, 4:DEBUG)");
+		printf("log level must be within range (0:NONE, 1:ERROR, 2:WARN, 3:INFO, 4:DEBUG)\n");
 		exit(1);
 	}
 	log_set_verbosity((log_level_t)verbosity);
+	printf("LOG_LEVEL = %i\n", LOG_LEVEL);
 
 	if (access(opts.web_root, R_OK | X_OK) == -1) { // list dir | open files inside
-		LOG(LOG_ERROR, "web_root not accessible: %s", opts.web_root);
+		printf("web_root not accessible: %s\n", opts.web_root);
 		exit(1);
 	}
 
+	printf("\033[0m"); // reset term color
+
 	if (listen_and_serve(port_num, opts.web_root, thread_count) == -1) {
-		LOG(LOG_ERROR, "server failed to start on port %d", opts.port);
+		printf("server failed to start on port %u\n", port_num);
 		exit(1);
 	}
 

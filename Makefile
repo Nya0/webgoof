@@ -3,7 +3,7 @@ CC := gcc
 
 # flags
 CFLAGS := -Wall -Wextra -Iinclude -D_GNU_SOURCE
-DEBUG_FLAGS := -g -O0 -fsanitize=address -fsanitize=undefined
+DEBUG_FLAGS := -g -O2 -fno-omit-frame-pointer
 PROD_FLAGS := -Os -DNDEBUG -march=native -flto \
   -ffunction-sections -fdata-sections -Wl,--gc-sections -s -static
   
@@ -14,7 +14,7 @@ BUILD_TYPE ?= debug
 
 ifeq ($(BUILD_TYPE), debug)
 	CFLAGS += $(DEBUG_FLAGS) -DLOG_LEVEL=4
-	LDFLAGS += -fsanitize=address -fsanitize=undefined
+# 	LDFLAGS += -fsanitize=address -fsanitize=undefined
 else ifeq ($(BUILD_TYPE), prod)
 	CC = musl-gcc
 	CFLAGS += $(PROD_FLAGS) -DLOG_LEVEL=0

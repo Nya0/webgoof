@@ -60,8 +60,6 @@ struct http_response {
 struct http_client {
 	int fd;
 	struct sockaddr_in addr;
-	socklen_t addr_len;
-
 	char *web_root;
 };
 

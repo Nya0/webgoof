@@ -5,3 +5,5 @@ benchmarks/
 obj
 bin
 compile_commands.json
+perf*
+profile.sh
