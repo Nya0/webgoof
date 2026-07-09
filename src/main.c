@@ -19,6 +19,7 @@
 #include <sys/sendfile.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/types.h>
 #include <sys/uio.h>
 #include <time.h>
 #include <unistd.h>
@@ -82,7 +83,7 @@ void *handle_client(struct http_client *client) {
 	struct http_request request = {0}; // zero init so logging is safe even if parse fails
 	struct http_response response = {0};
 
-	int file_fd = -1;
+	char *file_content = NULL;
 	off_t file_size = 0;
 
 	if (parse_request(raw_request, &request) == -1) {
@@ -115,7 +116,7 @@ void *handle_client(struct http_client *client) {
 	if (file == NULL) { // cache miss
 		LOG(LOG_ERROR, "cache miss: %s", file_path);
 
-		file_fd = open(file_path, O_RDONLY);
+		int file_fd = open(file_path, O_RDONLY);
 		if (file_fd == -1) {
 			LOG(LOG_WARN, "open %s: %s", file_path, strerror(errno));
 			response.status_code = HTTP_STATUS_NOT_FOUND;
@@ -125,19 +126,53 @@ void *handle_client(struct http_client *client) {
 		// read size
 		struct stat file_stat;
 		if (fstat(file_fd, &file_stat) < 0 || !S_ISREG(file_stat.st_mode)) {
+			close(file_fd);
 			response.status_code = HTTP_STATUS_NOT_FOUND;
 			goto finish;
 		}
 		file_size = file_stat.st_size;
 
-		int cs = cache_insert(file_path, file_fd, file_size);
-		if (cs == -1) {
-			LOG(LOG_ERROR, "cache insert failed: %s", file_path);
+		file_content = malloc(file_size);
+		if (file_content == NULL) {
+			LOG(LOG_ERROR, "failed to allocate memory for %s: %s", file_path, strerror(errno));
 			close(file_fd);
-			file_fd = -1;
+			response.status_code = HTTP_STATUS_INTERNAL_ERROR;
+			goto finish;
+		}
+
+		off_t total = 0;
+		while (total < file_size) {
+			ssize_t r = read(file_fd, file_content + total, file_size - total);
+			if (r == 0)
+				break;
+
+			if (r == -1) {
+				if (errno == EINTR)
+					continue;
+				break;
+			}
+			total += r;
+		}
+		close(file_fd);
+
+		if (total != file_size) {
+			LOG(LOG_ERROR, "short read %s: %lld/%lld", file_path, (long long)total, (long long)file_size);
+			free(file_content);
+			file_content = NULL;
+			response.status_code = HTTP_STATUS_INTERNAL_ERROR;
+			goto finish;
+		}
+
+		
+		if (cache_insert(file_path, file_content, file_size) == -1) {
+			LOG(LOG_ERROR, "cache insert failed: %s", file_path);
+			free(file_content);
+			file_content = NULL;
+			response.status_code = HTTP_STATUS_INTERNAL_ERROR;
+			goto finish;
 		}
 	} else { // cache hit
-		file_fd = file->fd;
+		file_content = file->content;
 		file_size = file->size;
 	}
 
@@ -155,54 +190,34 @@ void *handle_client(struct http_client *client) {
 	add_header(&response, "Content-Length", lenbuf);
 
 finish: {
-	
+
 	// write status text from status code
 	strcpy(response.status_text, get_status_text(response.status_code));
-	
+
 	// serialize and send response
 	size_t ser_len;
 	char *serialized = serialize_response_header(&response, &ser_len);
 	if (serialized) {
-		struct iovec iov[1] = {
-		    {.iov_base = serialized, .iov_len = ser_len},
-		};
-		writev(client->fd, iov, 1);
-
-		if (file_fd != -1) { // make sure there is a body so we dont serve trash
-			off_t offset = 0;
-			for (;;) {
-
-				ssize_t n = sendfile(client->fd, file_fd, &offset, file_size);
-				if (n > 0) {
-					if (offset >= file_size)
-						break;
-					continue;
-				}
-
-				if (n == -1) {
-					if (errno == EAGAIN) {
-						struct pollfd p = {.fd = client->fd, .events = POLLOUT};
-						poll(&p, 1, -1); // wait so we can send the rest of the file
-						continue;
-					};
-					if (errno == EINTR)
-						continue;
-					break; // real error
-				};
-			}
+		struct iovec iov[2];
+		int iovcnt = 0;
+		iov[iovcnt++] = (struct iovec){.iov_base = serialized, .iov_len = ser_len};
+		
+		if (file_content != NULL) { // there is file_content
+			iov[iovcnt++] = (struct iovec){.iov_base = file_content, .iov_len = file_size};
 		}
+		ssize_t w = writev(client->fd, iov, iovcnt);
 
+		LOG(LOG_DEBUG, "written %li", w);
 		free(serialized);
 	}
 }
-	
+
 cleanup: {
 	close(client->fd);
 	free(client);
 	LOG(LOG_DEBUG, "finished with client");
 	return 0;
 }
-	
 }
 
 int set_nonblocking(int fd) {
@@ -214,7 +229,7 @@ int set_nonblocking(int fd) {
 
 void accept_all(struct worker *w) {
 	for (;;) {
-		
+
 		struct http_client *client = malloc(sizeof(struct http_client)); // TODO: syscalls - zero-copy (maybe fine if we switch to keep-alive someday)
 		socklen_t addr_len = sizeof(client->addr);
 		client->web_root = w->web_root;
@@ -317,7 +332,7 @@ int listen_and_serve(in_port_t port, char *web_root, int thread_count) {
 	return 0;
 }
 
-typedef struct {
+typedef struct options {
 	char *port;
 	char *web_root;
 	char *thread_count;
@@ -328,10 +343,8 @@ options parse_args(int argc, char *argv[]) {
 	options opts = {0};
 	int c;
 
-	// Set defaults
 	opts.port = DEFAULT_PORT;
 	opts.web_root = DEFAULT_WEB_ROOT;
-	opts.thread_count = DEFAULT_THREAD_COUNT;
 	opts.verbosity = DEFAULT_VERBOSITY;
 
 	while ((c = getopt(argc, argv, "hp:w:t:v:")) != -1) {
@@ -352,7 +365,7 @@ options parse_args(int argc, char *argv[]) {
 			printf("Usage: %s [-w web_root] [-p port] [-t threads] [-v level]\n", argv[0]);
 			printf("  -w web_root  Web root directory (default: %s)\n", DEFAULT_WEB_ROOT);
 			printf("  -p port      Server port (default: %s)\n", DEFAULT_PORT);
-			printf("  -t threads   Thread Count (default: %s)\n", DEFAULT_THREAD_COUNT);
+			printf("  -t threads   Thread Count (default: number of online CPUs)\n");
 			printf("  -v           Verbosity level (default: %s) (0:NONE, 1:ERROR, 2:WARN, 3:INFO, 4:DEBUG)\n", DEFAULT_VERBOSITY);
 			printf("  -h           Show this help\n");
 			exit(EXIT_SUCCESS);
@@ -388,7 +401,14 @@ int main(int argc, char *argv[]) {
 	}
 	in_port_t port_num = (in_port_t)port_input;
 
-	uint16_t thread_count = atoi(opts.thread_count);
+	// default to online CPU count
+	uint16_t thread_count;
+	if (opts.thread_count != NULL) {
+		thread_count = atoi(opts.thread_count);
+	} else {
+		long cpus = sysconf(_SC_NPROCESSORS_ONLN);
+		thread_count = (cpus > 0) ? (uint16_t)cpus : (uint16_t)atoi(DEFAULT_THREAD_COUNT);
+	}
 	if (thread_count < 1 || thread_count > limit.rlim_cur) {
 		printf("thread range 1-%lu\n", limit.rlim_cur);
 		exit(1);

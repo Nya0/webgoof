@@ -33,20 +33,19 @@ struct cached_file *cache_lookup(const char *path) {
 	return entry;
 }
 
-int cache_insert(const char *path, int fd, off_t size) {
+int cache_insert(const char *path, char *content, off_t size) {
 	if (!cache_initialized) {
 		return -1;
 	}
 
-	struct cached_file *entry = calloc(1, sizeof *entry);
+	struct cached_file *entry = malloc(sizeof *entry);
 	if (!entry) {
-		close(fd);
 		return -1;
 	}
 
 	snprintf(entry->path, sizeof(entry->path), "%s", path);
-	entry->fd = fd;
 	entry->size = size;
+	entry->content = content;
 	entry->last_access = time(NULL);
 
 	pthread_rwlock_wrlock(&cache.lock);

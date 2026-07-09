@@ -15,7 +15,7 @@ struct file_cache {
 struct cached_file {
 	UT_hash_handle hh;
 	char path[256];
-	int fd;
+	char *content;
 	off_t size;
 	time_t last_access;
 };
@@ -24,4 +24,4 @@ void cache_init(int max_entries);
 struct cached_file *cache_lookup(const char *path);
 
 // returns 0 on success <0 on error
-int cache_insert(const char *path, int fd, off_t size);
+int cache_insert(const char *path, char *content, off_t size);
