@@ -1,16 +1,12 @@
 #include "http.h"
 #include "log.h"
 
-#include <arpa/inet.h>
 #include <netinet/in.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
-#include <sys/epoll.h>
-#include <sys/socket.h>
-#include <time.h>
 #include <unistd.h>
 
 static http_method_t parse_method(const char *method_str) {
@@ -80,7 +76,7 @@ int parse_request(char *raw_request, struct http_request *request) {
 	line = strtok_r(NULL, "\r\n", &line_saveptr);
 
 	int header_count = 0;
-	while (line != NULL && header_count < 16) { // NOLINT
+	while (line != NULL && header_count < HTTP_MAX_HEADERS) {
 		char *colon = strchr(line, ':');
 		if (colon != NULL) {
 			*colon = '\0';
@@ -98,6 +94,8 @@ int parse_request(char *raw_request, struct http_request *request) {
 			request->headers[header_count].value[sizeof(request->headers[header_count].value) - 1] = '\0';
 
 			header_count++;
+		} else { // reject if there is no :
+			return -1;
 		}
 
 		line = strtok_r(NULL, "\r\n", &line_saveptr);

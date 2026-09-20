@@ -25,7 +25,7 @@ struct cached_file *cache_lookup(const char *path) {
 
 	pthread_rwlock_rdlock(&cache.lock);
 	HASH_FIND_STR(cache.entries, path, entry);
-	if (entry) {
+	if (entry) { // TODO: fix 
 		entry->last_access = time(NULL);
 	}
 	pthread_rwlock_unlock(&cache.lock);

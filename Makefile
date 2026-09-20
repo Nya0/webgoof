@@ -1,60 +1,83 @@
-# Compiler
-CC := gcc
+CC := musl-gcc
 
-# flags
-CFLAGS := -Wall -Wextra -Iinclude -D_GNU_SOURCE
-DEBUG_FLAGS := -g -O2 -fno-omit-frame-pointer
-PROD_FLAGS := -Os -DNDEBUG -march=native -flto \
-  -ffunction-sections -fdata-sections -Wl,--gc-sections -s -static
-  
-LDFLAGS := -pthread
+CFLAGS  += -Wall -Wextra -D_GNU_SOURCE -idirafter /usr/include
+LIBS    := -pthread
 
-# Default to debug
-BUILD_TYPE ?= debug
+TARGET  := $(shell uname -s | tr '[A-Z]' '[a-z]' 2>/dev/null || echo unknown)
 
-ifeq ($(BUILD_TYPE), debug)
-	CFLAGS += $(DEBUG_FLAGS) -DLOG_LEVEL=4
-	LDFLAGS += -fsanitize=address -fsanitize=undefined
-else ifeq ($(BUILD_TYPE), prod)
-	CC = musl-gcc
-	CFLAGS += $(PROD_FLAGS) -DLOG_LEVEL=0
-else ifeq ($(BUILD_TYPE), dev)
-	CFLAGS += $(DEBUG_FLAGS)
+ifeq ($(TARGET), linux)
+	CFLAGS  += -D_POSIX_C_SOURCE -D_DEFAULT_SOURCE
 endif
 
-TARGET := bin/http-server
 SRC := $(wildcard src/*.c)
-OBJ := $(patsubst src/%.c, obj/%.o, $(SRC))
-DEPS := $(wildcard include/*.h)
 
-.PHONY: default debug prod dev clean run
+BIN  := http-server
+VER  ?= $(shell git describe --tags --always --dirty)
 
-default: debug
+ODIR := obj
+OBJ  := $(patsubst src/%.c,$(ODIR)/%.o,$(SRC))
+LIBS := -luring $(LIBS)
 
-debug:
-	@make clean
-	@BUILD_TYPE=debug make $(TARGET)
-	@echo "Debug build complete"
+DEPS    := $(wildcard include/*.h)
+CFLAGS  += -I$(ODIR)/include  -Iinclude
+LDFLAGS += -L$(ODIR)/lib
 
-prod: 
-	@make clean
-	@BUILD_TYPE=prod make $(TARGET)
-	@echo "Production build complete"
+CFLAGS += -DLOG_LEVEL=$(LOG_LEVEL)
 
-run: default
-	./$(TARGET)
+all: $(BIN)
 
 clean:
-	rm -f obj/*.o bin/*
+	$(RM) -rf $(BIN) obj/*
 
-dev:
-	@find src include -type f | entr -r sh -c 'BUILD_TYPE=debug make run'
+$(BIN): $(OBJ) $(ODIR)/lib/liburing.a
+	@echo LINK $(BIN)
+	$(CC) $(LDFLAGS) -o $@ $^ $(LIBS)
 
-$(TARGET): $(OBJ) | bin
-	$(CC) -o $@ $^ $(LDFLAGS)
+$(OBJ): Makefile $(DEPS) | $(ODIR)
 
-obj/%.o: src/%.c $(DEPS) | obj
-	$(CC) $(CFLAGS) -c $< -o $@
+$(ODIR):
+	@mkdir -p $@
 
-bin obj:
-	mkdir -p $@
+$(ODIR)/bytecode.o: src/wrk.lua
+	@echo LUAJIT $<
+	@$(SHELL) -c 'PATH=obj/bin:$(PATH) luajit -b $(CURDIR)/$< $(CURDIR)/$@'
+
+$(ODIR)/version.o:
+	@echo 'const char *VERSION="$(VER)";' | $(CC) -xc -c -o $@ -
+
+$(ODIR)/%.o : %.c
+	@echo CC $<
+	@$(CC) $(CFLAGS) -c -o $@ $<
+
+# dependiencies
+
+DEPS += $(ODIR)/lib/liburing.a
+
+LIBURING := $(notdir $(patsubst %.tar.gz,%,$(wildcard libs/liburing*.tar.gz)))
+
+
+$(ODIR)/$(LIBURING): libs/$(LIBURING).tar.gz | $(ODIR)
+	@rm -rf $@
+	@mkdir -p $@
+	@tar -C $@ --strip-components=1 -xf $<
+
+$(ODIR)/lib/liburing.a: $(ODIR)/$(LIBURING)
+	@echo Building liburing...
+	@mkdir -p $(ODIR)/lib
+	@cd $< && ./configure --cc=musl-gcc --cxx=musl-gcc
+	@$(MAKE) -C $</src \
+		CC="musl-gcc -idirafter /usr/include" \
+		ENABLE_SHARED=0
+	@cp $</src/liburing.a $(ODIR)/lib/liburing.a
+
+# ------------
+
+.PHONY: all clean
+.PHONY: $(ODIR)/version.o
+
+.SUFFIXES:
+.SUFFIXES: .c .o .lua
+
+vpath %.c   src
+vpath %.h   src
+vpath %.lua scripts

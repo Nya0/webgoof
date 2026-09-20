@@ -34,7 +34,7 @@ static const struct content_type_map {
     {".gif", "image/gif"},
     {NULL, NULL}};
 
-struct header {
+struct http_header {
 	char key[32];
 	char value[128];
 };
@@ -43,7 +43,7 @@ struct http_request {
 	unsigned int version;
 	http_method_t method;
 	char path[128];
-	struct header headers[HTTP_MAX_HEADERS];
+	struct http_header headers[HTTP_MAX_HEADERS];
 	int header_count;
 	char *body;
 };
@@ -51,7 +51,7 @@ struct http_request {
 struct http_response {
 	int status_code;
 	char status_text[32];
-	struct header headers[HTTP_MAX_HEADERS];
+	struct http_header headers[HTTP_MAX_HEADERS];
 	int header_count;
 	char *body;
 	size_t body_length;
@@ -60,10 +60,8 @@ struct http_response {
 struct http_client {
 	int fd;
 	struct sockaddr_in addr;
-	char *web_root;
 };
 
-static http_method_t parse_method(const char *method_str);
 const char *http_method_str(http_method_t method);
 int parse_request(char *raw_request, struct http_request *request);
 int add_header(struct http_response *response, const char *key, const char *value);

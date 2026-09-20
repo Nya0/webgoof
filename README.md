@@ -38,9 +38,18 @@ curl -v http://localhost:3030/
 - [x] http/1.0
 - [x] multi-threading
 - [x] cache files
+- [x] uring
+- [x] http/1.1
 - [ ] logs on their own thing
 - [ ] cache lru cleaning
-- [ ] update cache on file update
 - [ ] cache common responses
+- [ ] cache response line since its the same on the file
+- [ ] cache fd and use sendfile
+- [ ] find memory friendly solution for large files
+- [ ] update cache on file update
 - [ ] cleanup the code
-- [ ] http/1.1
+
+
+
+## Test
+

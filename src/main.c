@@ -1,12 +1,14 @@
 #include "cache.h"
 #include "http.h"
+
 #include "log.h"
 
 #include <arpa/inet.h>
+#include <asm-generic/errno.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <liburing.h>
 #include <netinet/in.h>
-#include <poll.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdbool.h>
@@ -15,14 +17,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/epoll.h>
 #include <sys/resource.h>
-#include <sys/sendfile.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/uio.h>
-#include <time.h>
 #include <unistd.h>
 
 #define DEFAULT_PORT "3030"
@@ -30,236 +29,39 @@
 #define DEFAULT_THREAD_COUNT "4"
 #define DEFAULT_VERBOSITY "4" // LOG_DEBUG
 
-#define QUEUE_SIZE 4096
-#define CLIENT_REQ_SIZE 1024 * 4
+#define CLIENT_REQ_SIZE 4096
+
+#define QUEUE_SIZE 256
+#define QUEUE_DEPTH 512
+
+#define BUF_COUNT 512
+#define BUF_SIZE CLIENT_REQ_SIZE
+
+// user_data tags for CQEs if they dont carry a connection pointer
+#define UD_ACCEPT 0 // multishot accept
+#define UD_SEND_FAIL 1 // failed send (its linked recv got canceled and does the teardown)
+
 
 struct worker {
 	int listen_fd;
-	int epfd;
-	char *web_root;
 };
 
-int handle_client(struct http_client *client) {
+struct connection {
+	int fd;
 
-	//-- get ip
-	char client_ip[INET_ADDRSTRLEN];
-	inet_ntop(AF_INET, &client->addr.sin_addr, client_ip, sizeof(client_ip));
-	in_port_t client_port = ntohs(client->addr.sin_port);
+	// request
+	struct http_request request;
+	char *frag_buf;
+	size_t frag_len;
 
-	//-- reading request
-	char raw_request[CLIENT_REQ_SIZE];
+	// response
+	struct http_response response;
+	struct iovec iov[2]; // [0] = serialized header, [1] = body
+	int iovcnt;
+	struct msghdr msg;
+};
 
-	// ssize_t total_read = 0;
-	// for (;;) {
-	// 	ssize_t n = read(client->fd, raw_request + total_read, (size_t)CLIENT_REQ_SIZE - 1 - total_read);
-	// 	LOG(LOG_ERROR, "total read: %u", total_read);
-	// 	LOG(LOG_ERROR, "n: %d", n);
-	// 	if (n > 0) {
-	// 		total_read += n;
-	// 		if (total_read >= CLIENT_REQ_SIZE - 1)
-	// 			break;
-	// 		continue;
-	// 	}
-
-	// 	if (n == 0) {
-	// 		goto cleanup;
-	// 	}
-	// 	if (n == -1) {
-	// 		LOG(LOG_ERROR, "read error: %d", n);
-	// 		if (errno == EAGAIN || errno == EWOULDBLOCK)
-	// 			break;    // drained
-	// 		goto cleanup; // real error
-	// 	};
-	// }
-
-	ssize_t n = read(client->fd, raw_request, (size_t)CLIENT_REQ_SIZE - 1);
-	if (n == 0)
-		return -1; // EOF client closed
-	if (n == -1) {
-		if (errno == EAGAIN || errno == EWOULDBLOCK)
-			return 0; 
-		return -1;   
-	}
-
-	raw_request[n] = '\0'; // null-terminate string
-
-	//-- parsing raw req
-	struct http_request request = {0}; // zero init so logging is safe even if parse fails
-	struct http_response response = {0};
-
-	int file_fd = -1;
-	char *file_content = NULL;
-	off_t file_size = 0;
-	bool large_file = false;
-
-	if (parse_request(raw_request, &request) == -1) {
-		response.status_code = HTTP_STATUS_BAD_REQUEST;
-		goto finish;
-	}
-
-	LOG(LOG_INFO, "%s %s (%s:%d)", http_method_str(request.method), request.path, client_ip, client_port);
-	for (int i = 0; i < request.header_count; i++) {
-		LOG(LOG_DEBUG, "  %s: %s", request.headers[i].key, request.headers[i].value);
-	}
-
-	if (strstr(request.path, "..") != NULL) { // path traversal temp fix
-		LOG(LOG_WARN, "blocked path traversal attempt: %s (%s:%d)", request.path, client_ip, client_port);
-
-		response.status_code = HTTP_STATUS_FORBIDDEN;
-		goto finish;
-	}
-
-	char file_path[256]; // NOLINT
-	if (strcmp(request.path, "/") == 0) {
-		snprintf(file_path, sizeof(file_path), "%s/index.html", client->web_root);
-	} else {
-		snprintf(file_path, sizeof(file_path), "%s%s", client->web_root, request.path);
-	}
-
-	//-- handling request
-	struct cached_file *file_hit = cache_lookup(file_path);
-	LOG(LOG_DEBUG, "file pointer: %p", file_hit);
-	if (file_hit == NULL) { // cache miss
-		LOG(LOG_WARN, "cache miss: %s", file_path);
-
-		file_fd = open(file_path, O_RDONLY);
-		if (file_fd == -1) {
-			LOG(LOG_WARN, "open %s: %s", file_path, strerror(errno));
-			response.status_code = HTTP_STATUS_NOT_FOUND;
-			goto finish;
-		}
-
-		// read size
-		struct stat file_stat;
-		if (fstat(file_fd, &file_stat) < 0 || !S_ISREG(file_stat.st_mode)) {
-			close(file_fd);
-			response.status_code = HTTP_STATUS_NOT_FOUND;
-			goto finish;
-		}
-		file_size = file_stat.st_size;
-
-		// if file bigger than 8mb mark it and skip reading
-		if (file_size > (1 << 23)) { // 2^23 (8mb)
-			large_file = true;
-			LOG(LOG_DEBUG, "(%s) using large_file mode", file_path);
-			goto filler;
-		}
-
-		file_content = malloc(file_size);
-		if (file_content == NULL) {
-			LOG(LOG_ERROR, "failed to allocate memory for %s: %s", file_path, strerror(errno));
-			close(file_fd);
-			response.status_code = HTTP_STATUS_INTERNAL_ERROR;
-			goto finish;
-		}
-
-		off_t total = 0;
-		while (total < file_size) {
-			ssize_t r = read(file_fd, file_content + total, file_size - total);
-			if (r == 0)
-				break;
-
-			if (r == -1) {
-				if (errno == EINTR)
-					continue;
-				break;
-			}
-			total += r;
-		}
-		close(file_fd);
-
-		if (total != file_size) {
-			LOG(LOG_ERROR, "short read %s: %lld/%lld", file_path, (long long)total, (long long)file_size);
-			free(file_content);
-			file_content = NULL;
-			response.status_code = HTTP_STATUS_INTERNAL_ERROR;
-			goto finish;
-		}
-
-		if (cache_insert(file_path, file_content, file_size) == -1) {
-			LOG(LOG_ERROR, "cache insert failed: %s", file_path);
-			free(file_content);
-			file_content = NULL;
-			response.status_code = HTTP_STATUS_INTERNAL_ERROR;
-			goto finish;
-		}
-	} else { // cache hit
-		file_content = file_hit->content;
-		file_size = file_hit->size;
-	}
-
-filler:
-	response.status_code = HTTP_STATUS_OK;
-
-	response.body = file_content;
-	response.body_length = file_size;
-
-	const char *content_type = get_content_type(file_path);
-	add_header(&response, "Content-Type", content_type);
-
-	char lenbuf[32];
-	snprintf(lenbuf, sizeof lenbuf, "%lld", (long long)response.body_length);
-	add_header(&response, "Content-Length", lenbuf);
-	add_header(&response, "Connection", "keep-alive");
-
-finish: {
-
-	// write status text from status code
-	strcpy(response.status_text, get_status_text(response.status_code));
-
-	// serialize and send response
-	size_t ser_len;
-	char *serialized = serialize_response_header(&response, &ser_len);
-	if (serialized) {
-		struct iovec iov[2];
-		int iovcnt = 0;
-
-		iov[iovcnt++] = (struct iovec){.iov_base = serialized, .iov_len = ser_len};
-
-		if (file_content != NULL) { // there is content (alt is large file path)
-			iov[iovcnt++] = (struct iovec){.iov_base = file_content, .iov_len = file_size};
-		}
-
-		ssize_t w = writev(client->fd, iov, iovcnt);
-		LOG(LOG_DEBUG, "written %li", w);
-
-		//-- handle large files
-		if (large_file) {
-			off_t offset = 0;
-			for (;;) {
-
-				ssize_t n = sendfile(client->fd, file_fd, &offset, file_size);
-				if (n > 0) {
-					if (offset >= file_size)
-						break;
-					continue;
-				}
-
-				if (n == -1) {
-					if (errno == EAGAIN) {
-						struct pollfd p = {.fd = client->fd, .events = POLLOUT};
-						poll(&p, 1, -1); // wait so we can send the rest of the file
-						continue;
-					};
-					if (errno == EINTR)
-						continue;
-					break; // real error
-				};
-			}
-			close(file_fd);
-		}
-
-		free(serialized);
-	}
-}
-
-cleanup: {
-	// close(client->fd);
-	// free(client);
-	LOG(LOG_DEBUG, "finished with client");
-	return 0;
-}
-}
+char *global_web_root;
 
 int set_nonblocking(int fd) {
 	int flags = fcntl(fd, F_GETFL, 0);
@@ -268,67 +70,268 @@ int set_nonblocking(int fd) {
 	return fcntl(fd, F_SETFL, flags | O_NONBLOCK);
 }
 
-void accept_all(struct worker *w) {
-	for (;;) {
+static struct io_uring_sqe *get_sqe(struct io_uring *r) {
+	struct io_uring_sqe *sqe = io_uring_get_sqe(r);
 
-		struct http_client *client = malloc(sizeof(struct http_client)); // TODO: syscalls - zero-copy (maybe fine if we switch to keep-alive someday)
-		socklen_t addr_len = sizeof(client->addr);
-		client->web_root = w->web_root;
-		client->fd = accept4(w->listen_fd, (struct sockaddr *)&client->addr, &addr_len, SOCK_NONBLOCK);
-		if (client->fd == -1) {
-			free(client);
+	return sqe;
+}
 
-			if (errno == EAGAIN || errno == EWOULDBLOCK)
-				break; // queue drained
+static void queue_accept(struct io_uring *r, struct worker *w) {
+	struct io_uring_sqe *sqe = get_sqe(r);
+	io_uring_prep_multishot_accept(sqe, w->listen_fd, NULL, NULL, 0);
+	io_uring_sqe_set_data64(sqe, UD_ACCEPT);
+}
+
+static void queue_read(struct io_uring *r, struct connection *c) {
+	struct io_uring_sqe *sqe = get_sqe(r);
+	io_uring_prep_recv_multishot(sqe, c->fd, NULL, 0, 0);
+	sqe->flags |= IOSQE_BUFFER_SELECT;
+	sqe->buf_group = 0;
+
+	io_uring_sqe_set_data(sqe, c);
+}
+
+static void queue_write(struct io_uring *r, struct connection *c) {
+	// the caller queues a linked recv right after
+	// land in the same submission or the link chain would be split
+	if (io_uring_sq_space_left(r) < 2)
+		io_uring_submit(r);
+
+	struct io_uring_sqe *sqe = get_sqe(r);
+
+	c->msg.msg_iov = c->iov;
+	c->msg.msg_iovlen = c->iovcnt;
+
+	io_uring_prep_sendmsg(sqe, c->fd, &c->msg, MSG_WAITALL | MSG_NOSIGNAL);
+	// -ECANCELED completion tears the connection down
+	io_uring_sqe_set_flags(sqe, IOSQE_CQE_SKIP_SUCCESS);
+	io_uring_sqe_set_data64(sqe, UD_SEND_FAIL);
+}
+
+// loads a file from cache or caches if it isnt. returns HTTP status
+// on ok *out points to cache owned mem
+static int load_file(const char *path, char **out, off_t *size) {
+	struct cached_file *hit = cache_lookup(path);
+	if (hit != NULL) {
+		*out = hit->content;
+		*size = hit->size;
+		return HTTP_STATUS_OK;
+	}
+
+	int fd = open(path, O_RDONLY);
+	if (fd == -1) {
+		LOG(LOG_WARN, "open %s: %s", path, strerror(errno));
+		return HTTP_STATUS_NOT_FOUND;
+	}
+
+	struct stat st;
+	if (fstat(fd, &st) < 0 || !S_ISREG(st.st_mode)) {
+		close(fd);
+		return HTTP_STATUS_NOT_FOUND;
+	}
+
+	char *buf = malloc(st.st_size);
+	if (buf == NULL) {
+		LOG(LOG_ERROR, "alloc %lld for %s: %s", (long long)st.st_size, path, strerror(errno));
+		close(fd);
+		return HTTP_STATUS_INTERNAL_ERROR;
+	}
+
+	off_t total = 0;
+	while (total < st.st_size) {
+		ssize_t r = read(fd, buf + total, st.st_size - total);
+		if (r == 0)
+			break;
+		if (r == -1) {
 			if (errno == EINTR)
-				continue; // interrupted mid accept, retry
+				continue;
 			break;
 		}
-
-		struct epoll_event ev;
-		ev.events = EPOLLIN | EPOLLET | EPOLLONESHOT;
-		ev.data.ptr = client;
-
-		epoll_ctl(w->epfd, EPOLL_CTL_ADD, client->fd, &ev);
+		total += r;
 	}
+	close(fd);
+
+	if (total != st.st_size || cache_insert(path, buf, st.st_size) == -1) {
+		LOG(LOG_ERROR, "read/cache failed: %s", path);
+		free(buf);
+		return HTTP_STATUS_INTERNAL_ERROR;
+	}
+
+	*out = buf;
+	*size = st.st_size;
+	return HTTP_STATUS_OK;
+}
+
+// fill client->response 
+void route_request(struct connection *client) {
+	if (strstr(client->request.path, "..") != NULL) { // path traversal guard
+		client->response.status_code = HTTP_STATUS_FORBIDDEN;
+		return;
+	}
+
+	char file_path[256];
+	if (strcmp(client->request.path, "/") == 0)
+		snprintf(file_path, sizeof file_path, "%s/index.html", global_web_root);
+	else
+		snprintf(file_path, sizeof file_path, "%s%s", global_web_root, client->request.path);
+
+	char *body;
+	off_t size;
+	int status = load_file(file_path, &body, &size);
+	client->response.status_code = status;
+	if (status != HTTP_STATUS_OK)
+		return;
+
+	client->response.body = body;
+	client->response.body_length = size;
+
+	add_header(&client->response, "Content-Type", get_content_type(file_path));
+}
+
+void build_response(struct connection *client) {
+	client->iovcnt = 0; // reset iter
+
+	char lenbuf[32];
+	snprintf(lenbuf, sizeof lenbuf, "%lld", (long long)client->response.body_length);
+	add_header(&client->response, "Content-Length", lenbuf); // needed for keep-alive
+	add_header(&client->response, "Connection", "keep-alive");
+
+	strcpy(client->response.status_text, get_status_text(client->response.status_code));
+
+	size_t ser_len;
+	char *serialized = serialize_response_header(&client->response, &ser_len);
+	client->iov[client->iovcnt++] = (struct iovec){.iov_base = serialized, .iov_len = ser_len};
+
+	if (client->response.body != NULL) {
+		client->iov[client->iovcnt++] =
+		    (struct iovec){.iov_base = client->response.body, .iov_len = client->response.body_length};
+	}
+
+	client->msg.msg_iov = client->iov;
+	client->msg.msg_iovlen = client->iovcnt;
+}
+
+static void close_conn(struct connection *c) {
+	close(c->fd);
+	free(c->iov[0].iov_base); // serialized header (NULL if response not built)
+	free(c);
+}
+
+void handle_client_read(struct io_uring *r, struct connection *client, char *data, int res) { // TODO: deny requests with bodies until we implement methods that accept and stop request smuggling
+	// free previous
+	free(client->iov[0].iov_base);
+	client->iov[0].iov_base = NULL;
+	client->iovcnt = 0;
+
+	char *term = memmem(data, res, "\r\n\r\n", 4);
+	if (term == NULL) {
+		// fragment path
+		return;
+	}
+
+	term[2] = '\0'; // (\r\n\0\n) null term for parse request so it doesnt blow to infinity
+	if (parse_request(data, &client->request) == -1)
+		client->response.status_code = HTTP_STATUS_BAD_REQUEST;
+	else
+		route_request(client);
+
+	build_response(client);
+	queue_write(r, client);
+
+	memset(&client->request, 0, sizeof client->request);
+	memset(&client->response, 0, sizeof client->response);
 }
 
 void *worker_thread(void *arg) {
 	struct worker *w = arg;
-	struct epoll_event events[64];
 
-	struct epoll_event lev = {.events = EPOLLIN, .data.ptr = NULL}; // NULL tags "it's the listener"
-	epoll_ctl(w->epfd, EPOLL_CTL_ADD, w->listen_fd, &lev);
+	// set up uring
+	struct io_uring ring;
+	io_uring_queue_init(QUEUE_DEPTH, &ring, IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_DEFER_TASKRUN);
+	io_uring_register_ring_fd(&ring);
+
+	    // setup buffer ring
+	    int err = 0;
+	struct io_uring_buf_ring *buffer_ring = io_uring_setup_buf_ring(&ring, BUF_COUNT, 0, 0, &err);
+	if (!buffer_ring) {
+		LOG(LOG_ERROR, "failed to create buffer ring: %d", strerror(err));
+		return NULL;
+	}
+
+	// create and hand buffers to the kernel
+	char *slab = calloc(BUF_COUNT, BUF_SIZE);
+	for (int i = 0; i < BUF_COUNT; i++)
+		io_uring_buf_ring_add(buffer_ring, slab + (i * BUF_SIZE), BUF_SIZE, i, io_uring_buf_ring_mask(BUF_COUNT), i);
+
+	io_uring_buf_ring_advance(buffer_ring, BUF_COUNT);
+
+	// jump start
+	queue_accept(&ring, w);
 
 	while (1) {
-		int n = epoll_wait(w->epfd, events, 64, -1);
-		for (int i = 0; i < n; i++) {
-			if (events[i].data.ptr == NULL) {
-				accept_all(w);
-			} else {
-				struct http_client *client = (struct http_client *)events[i].data.ptr;
+		io_uring_submit_and_wait(&ring, 1); // flush what was queued last iteration
 
-				struct epoll_event ev;
-				ev.events = EPOLLIN | EPOLLET | EPOLLONESHOT;
-				ev.data.ptr = client;
+		// loop state
+		uint head;
+		uint n = 0, returned = 0; // returned for buf_ring how many were used and freed to advance later;
 
-				if (handle_client(client) == -1) {
-					close(client->fd);
-					free(client);
-					LOG(LOG_DEBUG, "client disconnected");
-					continue;
+		struct io_uring_cqe *cqe;
+
+		io_uring_for_each_cqe(&ring, head, cqe) {
+			switch (cqe->user_data) {
+			case UD_ACCEPT: {
+				if (cqe->res >= 0) {
+					struct connection *c = calloc(1, sizeof *c);
+					c->fd = cqe->res;
+					queue_read(&ring, c);
+				}
+				if (!(cqe->flags & IORING_CQE_F_MORE)) // multishot accept ended re-arm
+					queue_accept(&ring, w);
+
+				break;
+			}
+
+			case UD_SEND_FAIL:
+				break;
+
+			default: {
+				struct connection *c = (void *)cqe->user_data;
+				char *data = NULL;
+				int bid = -1;
+
+				if (cqe->flags & IORING_CQE_F_BUFFER) {          
+					bid = cqe->flags >> IORING_CQE_BUFFER_SHIFT; 
+					data = slab + (size_t)bid * BUF_SIZE;        // buf_size is client_req_size
 				}
 
-				epoll_ctl(w->epfd, EPOLL_CTL_MOD, client->fd, &ev);
+				if (cqe->res > 0) {
+					handle_client_read(&ring, c, data, cqe->res);
+					if (!(cqe->flags & IORING_CQE_F_MORE))
+						queue_read(&ring, c); // alive ended, re-arm
+				} else if (cqe->res == -ENOBUFS) {
+					queue_read(&ring, c); // pool empty, re-arm
+				} else {
+					close_conn(c); // 0/error teardown
+				}
+
+				if (bid >= 0) {
+					io_uring_buf_ring_add(buffer_ring, data, BUF_SIZE, bid, io_uring_buf_ring_mask(BUF_COUNT), returned);
+					returned++;
+				}
 			}
+			}
+			n++;
 		}
+
+		io_uring_buf_ring_advance(buffer_ring, returned);
+		io_uring_cq_advance(&ring, n); // consume from cq
 	}
 }
 
 int make_listener(in_port_t port) {
 	int fd = socket(AF_INET, SOCK_STREAM, 0);
 	if (fd == -1) {
-		LOG(LOG_ERROR, "create socket: %s", port, strerror(errno));
+		LOG(LOG_ERROR, "create socket (p%u): %s", port, strerror(errno));
 		return fd;
 	}
 
@@ -357,19 +360,18 @@ int make_listener(in_port_t port) {
 }
 
 int listen_and_serve(in_port_t port, char *web_root, int thread_count) {
-	signal(SIGPIPE, SIG_IGN); // stop a broken client from closing the server
+	signal(SIGPIPE, SIG_IGN); // stop a broken client from killing the server
+	global_web_root = web_root;
 
 	for (int i = 0; i < thread_count; i++) {
 		pthread_t thread;
 
 		struct worker *w = calloc(1, sizeof *w);
-		w->epfd = epoll_create1(0);
 		w->listen_fd = make_listener(port);
 		if (w->listen_fd == -1) {
 			LOG(LOG_ERROR, "thread (%d) socket: %s", i, strerror(errno));
 			return -1;
 		}
-		w->web_root = web_root;
 
 		if (pthread_create(&thread, NULL, worker_thread, w) == -1) {
 			LOG(LOG_DEBUG, "thread (%d) creation: %s", i, strerror(errno));
@@ -380,7 +382,7 @@ int listen_and_serve(in_port_t port, char *web_root, int thread_count) {
 		LOG(LOG_DEBUG, "thread (%d) ready", i);
 	}
 
-	LOG(LOG_INFO, "listening on http://localhost:%d (serving %s with %d threads)", port, web_root, thread_count);
+	LOG(LOG_INFO, "listening on http://localhost:%d (serving %s using %d thread(s))", port, web_root, thread_count);
 	pause();
 
 	return 0;
@@ -463,8 +465,9 @@ int main(int argc, char *argv[]) {
 		long cpus = sysconf(_SC_NPROCESSORS_ONLN);
 		thread_count = (cpus > 0) ? (uint16_t)cpus : (uint16_t)atoi(DEFAULT_THREAD_COUNT);
 	}
+
 	if (thread_count < 1 || thread_count > limit.rlim_cur) {
-		printf("thread range 1-%lu\n", limit.rlim_cur);
+		printf("thread range 1-%lu\n", (unsigned long)limit.rlim_cur);
 		exit(1);
 	}
 
@@ -476,7 +479,7 @@ int main(int argc, char *argv[]) {
 	log_set_verbosity((log_level_t)verbosity);
 	printf("LOG_LEVEL = %i\n", LOG_LEVEL);
 
-	if (access(opts.web_root, R_OK | X_OK) == -1) { // list dir | open files inside
+	if (access(opts.web_root, R_OK | X_OK) == -1) { // can list dir | open files inside it
 		printf("web_root not accessible: %s\n", opts.web_root);
 		exit(1);
 	}
@@ -484,7 +487,9 @@ int main(int argc, char *argv[]) {
 	printf("\033[0m"); // reset term color
 
 	if (listen_and_serve(port_num, opts.web_root, thread_count) == -1) {
+		printf("\033[31m"); // red color for error area
 		printf("server failed to start on port %u\n", port_num);
+		printf("\033[0m"); // reset term color
 		exit(1);
 	}
 
